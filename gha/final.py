@@ -66,7 +66,7 @@ def gb(ver, d):
     b = glob.glob(f"{d}/geekbench{ver}")
     if not b: return J(f"gb{ver}", ok=False, err="binary missing", files=os.listdir(d)[:20] if os.path.isdir(d) else [])
     t = time.time(); rc, out = sh(f"cd {d} && ./geekbench{ver} --cpu", 1200); dt = time.time() - t
-    if rc != 0 and "internal code" in out:
+    if rc != 0 and "internal code" in out and os.environ.get("GB_RETRY") == "1":
         J(f"gb{ver}_retry", first_tail=out[-200:])
         e = dict(os.environ, SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt", SSL_CERT_DIR="/etc/ssl/certs", CURL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt")
         t = time.time(); rc, out = sh(f"cd {d} && ./geekbench{ver} --cpu", 1200, env=e); dt = time.time() - t
@@ -78,7 +78,7 @@ wait_until(0, "gb6"); gb(6, "gb6")
 wait_until(0 if QUICK else 600, "gb7"); gb(7, "gb7")
 
 # ---- SGEMM / vector math / ML (T0+20min)
-wait_until(0 if QUICK else 1260, "compute")
+wait_until(0 if QUICK else 1200, "compute")
 open("compute.py", "w").write(r'''
 import json, os, time, numpy as np
 out = {"numpy": np.__version__}
