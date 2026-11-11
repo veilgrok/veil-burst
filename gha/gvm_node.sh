@@ -29,32 +29,39 @@ printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmp
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
 NODES="10.89.0.1 10.89.0.2"
-# mk_l2 NODE LOCALCPUS BASECPUS -> l2_NODE.gz
+# mk_l2 NODE LOCALCPUS BASECPUS -> l2_NODE.gz   (L3: 512 MiB, mlock'd, earlyprintk serial; watchdog dumps monitor regs, vCPU kernel stacks, DSM debug)
+L3MEM=${L3MEM:-512}
 mk_l2() { local g=$1 lc=$2 bc=$3
 cat > init <<EOS
 #!/bin/busybox sh
 /bin/busybox mkdir -p /bb; /bin/busybox --install -s /bb
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/bb
-mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev
+mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; mount -t debugfs d /sys/kernel/debug 2>/dev/null
 exec >/dev/ttyS0 2>&1 </dev/null
+dmesg -n 1
 ip link set lo up; ip link set eth0 up; ip addr add 10.89.0.$((g+1))/32 dev eth0; ip route add 10.90.$g.1 dev eth0; ip route add default via 10.90.$g.1
-echo L2 node=$g nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) \$(grep MemTotal /proc/meminfo)
+echo L2 node=$g nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) svm=\$(grep -c -w svm /proc/cpuinfo) \$(grep MemTotal /proc/meminfo)
 /opt/gvm/pbench 1 10000000 | sed "s/^/L2BARE /"; /opt/gvm/pbench \$(nproc) 10000000 | sed 's/^/L2BARE /'
 sleep 3; cd /opt/gvm
-echo GVM_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m 2048 -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
+dbg() { echo "WATCH t=\$1"; printf 'info status\ninfo cpus\ninfo registers\n' | nc -w 2 127.0.0.1 4444 2>&1 | tr -d '\r' | grep -aE "VM status|CPU #|RIP=|CS =|CR0=" | head -12 | sed 's/^/MON /'
+  for p in \$(pidof qemu-system-x86_64); do for t in /proc/\$p/task/*; do echo "TASK \$(cat \$t/comm) wchan=\$(cat \$t/wchan) state=\$(grep State \$t/status | cut -f2)"; head -6 \$t/stack | sed 's/^/  STK /'; done; done | head -60
+  echo "DSMDBG lines=\$(dmesg | grep -ac -iE 'dsm|ivy')"; dmesg | grep -aiE 'dsm|ivy|ktcp' | head -40 | sed 's/^/DSMDBG /'; dmesg | grep -aiE 'dsm|ivy|ktcp' | tail -15 | sed 's/^/DSMTAIL /'; }
+echo GVM_START \$(date +%s)
+( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
+for t in 45 150 300; do sleep \$((t - \${last:-0})); last=\$t; pidof qemu-system-x86_64 >/dev/null || break; dbg \$t; done
+pidof qemu-system-x86_64 >/dev/null && { echo GVM_KILL; killall qemu-system-x86_64; sleep 2; }
 echo GVM_END \$(date +%s)
-if [ $g = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m 2048 -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
-dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
+if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
-runl2() { timeout 900 qemu-system-x86_64 -enable-kvm -cpu host -smp $2 -m $3 -kernel art/bzImage -initrd l2_$1.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
-  -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no -device e1000,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|BASE)|dsm|DSM|panic" | sed -u "s/^/[n$1] /"; }
+runl2() { timeout 700 qemu-system-x86_64 -enable-kvm -cpu host -smp $2 -m $3 -kernel art/bzImage -initrd l2_$1.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
+  -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no -device e1000,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|BASE|WATCH|MON|TASK|  STK|DSM)|panic" | sed -u "s/^/[n$1] /"; }
 if [ $MODE = pair ]; then
-  mktap $G; mk_l2 $G 4 4; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
+  mktap $G; mk_l2 $G 1 1; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
   runl2 $G 4 12288
 else  # solo Intel runner: two GiantVM nodes as two L2 hosts on this runner (honest label: same physical runner)
-  mktap 0; mktap 1; mk_l2 0 2 2; mk_l2 1 2 2
+  mktap 0; mktap 1; mk_l2 0 1 1; mk_l2 1 1 1
   runl2 0 2 6144 & sleep 1; runl2 1 2 6144; wait
 fi
 J "{\"kind\":\"gvm_done\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
