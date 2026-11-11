@@ -1,0 +1,26 @@
+name: veil-uspan
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url: {required: true, type: string}
+      art_run: {required: true, type: string}
+      cfgsu: {required: false, default: "U_memfd U_uffd U_rem U_rem_evict U_memfd2 U_uffd2 U_rem2", type: string}
+permissions: {contents: read, actions: read}
+jobs:
+  node:
+    strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {name: gvm, path: art, run-id: "${{ inputs.art_run }}", github-token: "${{ github.token }}"}
+      - name: two-level uffd memory spanning
+        env:
+          GIDX: ${{ matrix.gidx }}
+          CFGSU: ${{ inputs.cfgsu }}
+          VEIL_RELAY_URL: ${{ inputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: |
+          sudo sysctl -qw vm.unprivileged_userfaultfd=1; sudo modprobe wireguard || true
+          docker run --rm --privileged --network host -v /dev:/dev -v $GITHUB_WORKSPACE:/w -w /w -e GIDX -e CFGSU -e GITHUB_RUN_ID -e VEIL_RELAY_URL -e VEIL_RELAY_TOKEN debian:trixie bash -c 'export DEBIAN_FRONTEND=noninteractive; timeout 600 apt-get -qq update >/dev/null 2>&1; timeout 900 apt-get -qq install -y --no-install-recommends qemu-system-x86 busybox-static cpio gcc libc6-dev python3 util-linux iproute2 iputils-ping wireguard-tools curl ca-certificates >/dev/null 2>&1; echo "STEP docker-apt rc=$? $(qemu-system-x86_64 --version | head -1)"; bash gha/uspan.sh'
