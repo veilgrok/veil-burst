@@ -73,7 +73,7 @@ if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qe
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
 runl2() { timeout ${L2T:-1000} qemu-system-x86_64 -enable-kvm -cpu host -smp $2 -m $3 -kernel art/bzImage -initrd l2_$1.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
-  -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|BASE|WATCH|MON|TASK|  STK|DSM)|panic" | sed -u "s/^/[n$1] /"; }
+  -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|B2|BASE|WATCH|MON|TASK|  STK|DSM)|panic" | sed -u "s/^/[n$1] /"; }
 if [ $MODE = pair ]; then
   mktap $G; mk_l2 $G 1 1; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
   runl2 $G 4 12288
