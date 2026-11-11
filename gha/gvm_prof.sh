@@ -51,6 +51,7 @@ dmesg -n 1
 echo L2 nproc=\$(nproc) \$(grep MemTotal /proc/meminfo) dsm_verbose=\$(cat /sys/module/kvm/parameters/dsm_verbose 2>&1) ept=\$(cat /sys/module/kvm_intel/parameters/ept 2>&1)
 /opt/gvm/pbench 1 10000000 | sed "s/^/L2BARE /"
 cd /opt/gvm
+echo "L2 kvm=\$(ls -la /dev/kvm 2>&1) gvmq=\$(./qemu-system-x86_64 --version 2>&1 | head -1) timeout=\$(command -v timeout)"
 snap() { for f in /sys/kernel/debug/kvm/*; do [ -f "\$f" ] && echo "\${f##*/} \$(cat \$f)"; done; }
 ktr() { T=/sys/kernel/debug/tracing; [ -d \$T/events/kvm/kvm_exit ] || { echo "TRACE none"; return; }; echo > \$T/trace; echo 1 > \$T/events/kvm/kvm_exit/enable; sleep 2; echo 0 > \$T/events/kvm/kvm_exit/enable; grep -o 'reason [A-Z_]*' \$T/trace | sort | uniq -c | sort -rn | head -8 | tr '\n' ';' | sed 's/^/TRACE2s /'; echo; }
 run() { n=\$1; shift; echo "CFG_START \$n"; timeout 300 "\$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do read up x </proc/uptime; case "\$l" in *PB_START*) t0=\$up; snap > /tmp/s0; (sleep 3; ktr) & ;; *PBENCH*) snap > /tmp/s1; echo "PROF \$n wall_s=\$(awk "BEGIN{print \$up-\$t0}") \$(awk 'NR==FNR{a[\$1]=\$2;next}{d=\$2-a[\$1]; if(d>0) printf "%s=%d ",\$1,d}' /tmp/s0 /tmp/s1)";; esac; echo "[\$n] @\$up \$l"; done; echo "CFG_END \$n"; }
@@ -71,5 +72,5 @@ esac; done
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2.gz)
-timeout ${L2T:-2400} qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -kernel art/bzImage -initrd l2.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot -net none 2>&1 | grep -a --line-buffered -E "^(L2|PROF|TRACE|CFG_|STOCK|\[[A-Za-z_]+\] @[0-9.]+ (L3 |IRQ|PBENCH|PB_|.*(clocksource|tsc|error|panic|Kernel)))"
+timeout ${L2T:-2400} qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 4096 -kernel art/bzImage -initrd l2.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot -net none 2>&1 | grep -a --line-buffered -E "^(L2|PROF|TRACE|CFG_|STOCK|\[[A-Za-z_]+\] @[0-9.]+ (L3 |IRQ|PBENCH|PB_|qemu|Could|.*(clocksource|tsc|error|rror|panic|Kernel|not found|No such)))"
 J "{\"kind\":\"prof_done\",\"gidx\":$GIDX}"
