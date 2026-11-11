@@ -24,39 +24,42 @@ sudo ip addr add 10.88.0.$((G+1))/24 dev wg0; sudo ip link set wg0 up; sudo ip r
 sudo wg show wg0 | grep -E "endpoint|handshake|transfer"; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
 fi
-# --- tap for L2, routed (no NAT)
-sudo ip tuntap add tap0 mode tap user $(id -un); sudo ip addr add 10.90.$G.1/24 dev tap0; sudo ip link set tap0 up
-sudo ip route add 10.89.0.$((G+1))/32 dev tap0; sudo sysctl -qw net.ipv4.ip_forward=1; sudo iptables -I FORWARD -j ACCEPT
-# --- L3 guest initrd (busybox + pbench)
-gcc -O2 -static -pthread -o pbench gha/pbench.c
-mkdir -p l3/bin l3/proc l3/sys l3/dev; cp /bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
+sudo sysctl -qw net.ipv4.ip_forward=1; sudo iptables -I FORWARD -j ACCEPT
+mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.90.$1.1/24 dev tap$1; sudo ip link set tap$1 up; sudo ip route add 10.89.0.$(($1+1))/32 dev tap$1; }
+# --- L2 userland (ubuntu18.04 + QEMU-gvm); L3 initrd uses 18.04's baseline-x86-64 busybox and a -march=x86-64 pbench
+mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
+gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c
+mkdir -p l3/bin l3/proc l3/sys l3/dev; cp l2/bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
 printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\n/bin/pbench 1 10000000\n/bin/pbench $(nproc) 10000000\npoweroff -f\n' > l3/init; chmod +x l3/init
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
-# --- L2 initramfs = ubuntu18.04 userland with QEMU-gvm
-mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2; sudo cp art/bzImage l3.gz l2/opt/gvm/; sudo cp pbench l2/opt/gvm/
-NODES="10.89.0.1 10.89.0.2"; ME=10.89.0.$((G+1)); SOLO=$([ $MODE = solo ] && echo 1 || echo 0)
+sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
+NODES="10.89.0.1 10.89.0.2"
+# mk_l2 NODE LOCALCPUS BASECPUS -> l2_NODE.gz
+mk_l2() { local g=$1 lc=$2 bc=$3
 cat > init <<EOS
 #!/bin/busybox sh
 /bin/busybox mkdir -p /bb; /bin/busybox --install -s /bb
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/bb
 mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev
 exec >/dev/ttyS0 2>&1 </dev/null
-ip link set lo up; ip link set eth0 up; ip addr add $ME/32 dev eth0; ip route add 10.90.$G.1 dev eth0; ip route add default via 10.90.$G.1
-echo L2 nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) svm=\$(grep -c -w svm /proc/cpuinfo) \$(grep MemTotal /proc/meminfo); ls -l /dev/kvm
+ip link set lo up; ip link set eth0 up; ip addr add 10.89.0.$((g+1))/32 dev eth0; ip route add 10.90.$g.1 dev eth0; ip route add default via 10.90.$g.1
+echo L2 node=$g nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) \$(grep MemTotal /proc/meminfo)
 /opt/gvm/pbench 1 10000000 | sed "s/^/L2BARE /"; /opt/gvm/pbench \$(nproc) 10000000 | sed 's/^/L2BARE /'
-sleep 2
-cd /opt/gvm
-if [ $SOLO = 0 ]; then
-echo GVM_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 8 -m 3072 -local-cpu 4,start=$((G*4)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
-echo GVM_END \$? \$(date +%s)
-fi
-if [ $G = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 4 -m 3072 -local-cpu 4,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
- dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
+sleep 3; cd /opt/gvm
+echo GVM_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu host -smp $((2*lc)) -m 2048 -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
+echo GVM_END \$(date +%s)
+if [ $g = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu host -smp $bc -m 2048 -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
 /bb/poweroff -f
 EOS
-sudo cp init l2/init; sudo chmod +x l2/init
-(cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2.gz); ls -la l2.gz
-if [ $MODE = pair ]; then K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null; fi
-timeout 1000 qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 12288 -kernel art/bzImage -initrd l2.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
-  -netdev tap,id=n0,ifname=tap0,script=no,downscript=no -device e1000,netdev=n0 2>&1 | tee l2.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|BASE)|dsm|DSM|panic"; tr -d "\r" < l2.log | grep -vE "^\[ *[0-9]+\.[0-9]+\] (ACPI|pci|PCI|clocksource|e820|BIOS|x86|NODE|Zone|On node|smpboot|Memory|devtmpfs|random|NET|TCP|UDP|audit|ata|scsi|usb|serial|input|rtc|hid|tsc|Freeing|Write|Key|Run|Spectre|Unpacking|Trying|cpuidle|thermal|ehci|ohci|uhci|i8042|mousedev|libata|sd |sr |cdrom|e1000|nf_|ip_tables|Initializing|Loading|registered|PM|AMD|smp|Mount|Hierarchical|rcu|Dentry|Inode|mem auto|NR_IRQS|Console|console|APIC|IOAPIC|percpu|pcpu|Built|Policy|kvm-clock|hpet|Calibrating|pid_max|LSM|SELinux|Yama|Last level|Performance|cblist|NMI|devres|Huh|DMA|workingset|zbud|io scheduler|shpchp|Non-volatile|loop|tun|libphy|VFIO|Asymmetric|PPP|SLIP|Bridge|Segment|sched_clock|Booting|bootconsole|tsc:|check:|Linux agpgart|agpgart|intel_pstate|ledtrig|drop_monitor|Initialise|microcode|IPI|Btrfs|AppArmor|evm|ima|Unstable|clk:|platform|EDAC|sched|software IO|crash|Command line|Kernel command|DMI|Hypervisor|tracing|kvm-guest|Detected|Lock|smpboot|cpu|CPU|futex|xor|raid6|workqueue|async_tx|alg|Block|io|vgaarb|SCSI|wmi|power|Fixed|floppy|Real Time|Freeing|pnp|mce|resource|system 00|clk|ftrace|kprobe|cryptd|gre|ipip|Initialise|virtio|8021q|NET:|Segment|lp:|ppdev|parport)" | tail -80
-J "{\"kind\":\"gvm_done\",\"gidx\":$G}"
+sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
+runl2() { timeout 900 qemu-system-x86_64 -enable-kvm -cpu host -smp $2 -m $3 -kernel art/bzImage -initrd l2_$1.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
+  -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no -device e1000,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|BASE)|dsm|DSM|panic" | sed -u "s/^/[n$1] /"; }
+if [ $MODE = pair ]; then
+  mktap $G; mk_l2 $G 4 4; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
+  runl2 $G 4 12288
+else  # solo Intel runner: two GiantVM nodes as two L2 hosts on this runner (honest label: same physical runner)
+  mktap 0; mktap 1; mk_l2 0 2 2; mk_l2 1 2 2
+  runl2 0 2 6144 & sleep 1; runl2 1 2 6144; wait
+fi
+J "{\"kind\":\"gvm_done\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
