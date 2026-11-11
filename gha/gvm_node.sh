@@ -19,7 +19,7 @@ sudo ip route add 10.89.0.$((G+1))/32 dev tap0; sudo sysctl -qw net.ipv4.ip_forw
 # --- L3 guest initrd (busybox + pbench)
 gcc -O2 -static -pthread -o pbench gha/pbench.c
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp /bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
-printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\n/bin/pbench 1 10000000\n/bin/pbench $(nproc) 10000000\npoweroff -f\n' > l3/init; chmod +x l3/init
+printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\n/bin/pbench 1 10000000\n/bin/pbench $(nproc) 10000000\npoweroff -f\n' > l3/init; chmod +x l3/init
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
 # --- L2 initramfs = ubuntu18.04 userland with QEMU-gvm
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2; sudo cp art/bzImage l3.gz l2/opt/gvm/; sudo cp pbench l2/opt/gvm/
@@ -36,7 +36,9 @@ echo L2 nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) svm=\$(grep -c -w s
 sleep 2
 echo GVM_START \$(date +%s)
 cd /opt/gvm; ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 8 -m 3072 -local-cpu 4,start=$((G*4)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
-echo GVM_END \$? \$(date +%s); dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
+echo GVM_END \$? \$(date +%s)
+if [ $G = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 4 -m 3072 -local-cpu 4,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+ dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init
