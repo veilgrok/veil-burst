@@ -23,7 +23,7 @@ sudo sysctl -qw net.ipv4.ip_forward=1; sudo iptables -I FORWARD -j ACCEPT
 mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.90.$1.1/24 dev tap$1; sudo ip link set tap$1 up; sudo ip route add 10.89.0.$(($1+1))/32 dev tap$1; }
 # --- L2 userland (ubuntu18.04 + QEMU-gvm); L3 initrd uses 18.04's baseline-x86-64 busybox and a -march=x86-64 pbench
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
-gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c
+if [ -x art/pbench ] || [ -f art/pbench ]; then cp art/pbench pbench; chmod +x pbench; else gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c; fi
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp l2/bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
 printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\n/bin/pbench 1 10000000\n/bin/pbench $(nproc) 10000000\npoweroff -f\n' > l3/init; chmod +x l3/init
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
@@ -46,12 +46,13 @@ sleep 3; cd /opt/gvm
 dbg() { echo "WATCH t=\$1"; printf 'info status\ninfo cpus\ninfo registers\n' | nc -w 2 127.0.0.1 4444 2>&1 | tr -d '\r' | grep -aE "VM status|CPU #|RIP=|CS =|CR0=" | head -12 | sed 's/^/MON /'
   for p in \$(pidof qemu-system-x86_64); do for t in /proc/\$p/task/*; do echo "TASK \$(cat \$t/comm) wchan=\$(cat \$t/wchan) state=\$(grep State \$t/status | cut -f2)"; head -6 \$t/stack | sed 's/^/  STK /'; done; done | head -60
   echo "DSMDBG lines=\$(dmesg | grep -ac -iE 'dsm|ivy')"; dmesg | grep -aiE 'dsm|ivy|ktcp' | head -40 | sed 's/^/DSMDBG /'; dmesg | grep -aiE 'dsm|ivy|ktcp' | tail -15 | sed 's/^/DSMTAIL /'; }
+echo 1 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; echo DSMVERBOSE=\$(cat /sys/module/kvm/parameters/dsm_verbose 2>&1)
 echo GVM_START \$(date +%s)
-( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
-for t in 45 150 300; do sleep \$((t - \${last:-0})); last=\$t; pidof qemu-system-x86_64 >/dev/null || break; dbg \$t; done
+( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -machine pc,kernel-irqchip=off -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
+for t in 45 150 300; do sleep \$((t - \${last:-0})); last=\$t; pidof qemu-system-x86_64 >/dev/null || break; dbg \$t; echo 0 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; done
 pidof qemu-system-x86_64 >/dev/null && { echo GVM_KILL; killall qemu-system-x86_64; sleep 2; }
 echo GVM_END \$(date +%s)
-if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
