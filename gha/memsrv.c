@@ -16,6 +16,6 @@ int main(int c, char **v){ int port=atoi(v[1]); size_t sz=(size_t)atol(v[2])<<20
   fprintf(stderr,"MEMSRV listening %d size=%zuMiB\n",port,sz>>20);
   for(;;){ int s=accept(ls,0,0); setsockopt(s,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); unsigned long g=0,p=0; time_t last=time(0);
     for(;;){ char op; uint64_t off; if(xfer(s,&op,1,0)||xfer(s,&off,8,0)) break; if(off+4096>sz){ fprintf(stderr,"bad off\n"); break; }
-      if(op=='G'){ if(xfer(s,m+off,4096,1)) break; g++; } else if(op=='P'){ if(xfer(s,m+off,4096,0)) break; p++; } else break;
+      if(op=='G'){ if(xfer(s,m+off,4096,1)) break; g++; } else if(op=='R'){ uint32_t n; if(xfer(s,&n,4,0)||off+(uint64_t)n*4096>sz) break; if(xfer(s,m+off,(size_t)n*4096,1)) break; g+=n; } else if(op=='P'){ if(xfer(s,m+off,4096,0)) break; p++; } else break;
       if(time(0)-last>=5){ last=time(0); fprintf(stderr,"MEMSRV gets=%lu puts=%lu\n",g,p);} }
     fprintf(stderr,"MEMSRV client closed gets=%lu puts=%lu\n",g,p); close(s); } }

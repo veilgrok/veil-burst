@@ -4,7 +4,7 @@ on:
     inputs:
       relay_url: {required: true, type: string}
       art_run: {required: true, type: string}
-      cfgsu: {required: false, default: "U_memfd U_uffd U_rem U_rem_evict U_memfd2 U_uffd2 U_rem2", type: string}
+      cfgsu: {required: false, default: "U_memfd U_uffd U_rem U_rem_b1 U_rem_b64 U_rem_evict U_memfd2 U_uffd2 U_rem2 U_rem_evict2", type: string}
 permissions: {contents: read, actions: read}
 jobs:
   node:
