@@ -15,7 +15,7 @@ p=p or (ks[0],ks[1]); print(p[0],p[1])")"
   if [ "$G" = "$PA" ]; then G=0; elif [ "$G" = "$PB" ]; then G=1; else echo "not picked"; exit 0; fi
 fi
 LQ=0; L() { echo "$*"; LQ=$((LQ+1)); (K put vs-$RUN-log-$G-$(date +%s%N) "$*" >/dev/null 2>&1 &) ; }
-P=$((1-G)); J "{\"kind\":\"node\",\"gidx\":$G,\"cpu\":\"$(lscpu | sed -n 's/Model name: *//p' | head -1)\",\"region\":\"$REG\",\"eptad\":\"$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na)\"}"
+P=$((1-G)); L "NODE cpu=$(lscpu | sed -n "s/Model name: *//p" | head -1) region=$REG eptad=$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na)"; J "{\"kind\":\"node\",\"gidx\":$G,\"cpu\":\"$(lscpu | sed -n 's/Model name: *//p' | head -1)\",\"region\":\"$REG\",\"eptad\":\"$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na)\"}"
 gcc -O2 -pthread -o dsm gha/dsm.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -static -pthread -o xcheck gha/xcheck.c && gcc -O2 -static -pthread -o pbench gha/pbench.c || { echo build failed; exit 1; }
 mkdir -p /l2r && tar -xzf art/l2root.tar.gz -C /l2r && mkdir -p /l2r/w && mount --bind $PWD /l2r/w && mount --rbind /dev /l2r/dev && mount -t proc p /l2r/proc || { echo chroot setup failed; exit 1; }
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp /l2r/bin/busybox pbench memtouch xcheck l3/bin/; for c in sh cat grep nproc poweroff mount head tr; do ln -sf busybox l3/bin/$c; done
@@ -32,7 +32,7 @@ poweroff -f
 EOI
 chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3x.gz)
 # stamp + summarize: host wall time between markers on the BSP serial
-stamp() { n=$1; while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB1_START*) a=$now;; *PB2_START*) b=$now; L "PROF $n pb1_wall_s=$(python3 -c "print(round($b-$a,3))")";; *MT_START*) c=$now; L "PROF $n pb2_wall_s=$(python3 -c "print(round($c-$b,3))")";; *XC_START*) d=$now; L "PROF $n mt_wall_s=$(python3 -c "print(round($d-$c,3))")";; *PB_DONE*) L "PROF $n xc_wall_s=$(python3 -c "print(round($now-$d,3))")";; esac
+stamp() { n=$1; while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB1_START*) a=$now;; *PB2_START*) b=$now; L "PROF $n pb1_wall_s=$(python3 -c "print(round($b-$a,3))")";; *MT_START*) c=$now; L "PROF $n pb2_wall_s=$(python3 -c "print(round($c-$b,3))")";; *XC_START*) d=$now; L "PROF $n mt_wall_s=$(python3 -c "print(round($d-$c,3))")";; *PB_DONE*) L "PROF $n xc_wall_s=$(python3 -c "print(round($now-$d,3))")"; (sleep 3; pkill -9 -f opt/gvm/qemu-system; pkill -9 -f "qemu-system-x86_64 -enable-kvm") & ;; esac
   case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*"Total of"*|*"Command line"*|*rror*|*panic*|*DSM*|*"set kvmclock"*|*"RTT"*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp 2 -m 512 -kernel /w/art/bzImage -initrd /w/l3x.gz -nographic -no-reboot -net none"
 GA="console=ttyS0 panic=-1 no_timer_check noapic"
@@ -50,16 +50,16 @@ print(d.decode(errors="replace"))
 PY
   done; tail -2 home.log 2>/dev/null | sed "s/^/HOME t=$t /" | while IFS= read -r x; do L "$x"; done; done; }
 run_split_local() { n=$1; shm0=$2; shm1=$3; env0=$4; T0=$(date +%s.%N); rm -f /dev/shm/veil*
-  [ -n "$env0" ] && { timeout ${ST:-600} ./dsm home 7910 131072 2> home.log & }
-  sleep 0.5; timeout ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path $shm1 -append "$GA" -local-cpu 1,start=1,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4445,server,nowait > ap_$n.log 2>&1 &
-  sleep 1; (WATCHT="60 180 400" watch_mon 4444 4445 &) ; timeout ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path $shm0 -append "$GA" -local-cpu 1,start=0,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $n
+  [ -n "$env0" ] && { timeout -s KILL ${ST:-600} ./dsm home 7910 131072 2> home.log & }
+  sleep 0.5; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path $shm1 -append "$GA" -local-cpu 1,start=1,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4445,server,nowait > ap_$n.log 2>&1 &
+  sleep 1; (WATCHT="60 180 400" watch_mon 4444 4445 &) ; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path $shm0 -append "$GA" -local-cpu 1,start=0,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $n
   wait; grep -a "DSM node1" ap_$n.log | tail -1 | sed "s/^/[$n-ap] /"; [ -n "$env0" ] && tail -3 home.log | sed "s/^/[$n-home] /"; pkill -f "dsm home" ; pkill -9 -f opt/gvm/qemu; L "CFG_END $n"; }
 if [ $G = 0 ] && has B; then
   for i in 1 2; do t0=$(date +%s.%N); o=$(./pbench 1 10000000); t1=$(date +%s.%N); o2=$(./pbench 2 10000000); t2=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))")"; done
   # two-level stock QEMU 10 memfd, 2 vCPUs (the comparison target)
-  T0=$(date +%s.%N); timeout 180 qemu-system-x86_64 -enable-kvm -smp 2 -m 512 -cpu kvm64 -kernel art/bzImage -initrd l3x.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A2_memfd; L "CFG_END A2"
+  T0=$(date +%s.%N); timeout -s KILL 180 qemu-system-x86_64 -enable-kvm -smp 2 -m 512 -cpu kvm64 -kernel art/bzImage -initrd l3x.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A2_memfd; L "CFG_END A2"
   # QEMU-gvm single process 2 vCPUs, userspace APIC (cost of the gvm VMM itself)
-  T0=$(date +%s.%N); timeout 240 chroot /l2r $GQ -append "$GA" 2>&1 | stamp G1_gvm; L "CFG_END G1"
+  T0=$(date +%s.%N); timeout -s KILL 240 chroot /l2r $GQ -append "$GA" 2>&1 | stamp G1_gvm; L "CFG_END G1"
 fi
 if [ $G = 0 ]; then
   has S1 && ST=300 run_split_local S1_shm veilram veilram ""
@@ -76,12 +76,12 @@ ip addr add 10.88.0.$((G+1))/24 dev wg0; ip link set wg0 mtu 1420 up; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
 rm -f /dev/shm/veil*; T0=$(date +%s.%N); XT=${XT:-1800}
 if [ $G = 0 ]; then
-  timeout $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
+  timeout -s KILL $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
   (WATCHT="120 300 600 900 1200 1500" watch_mon 4444 &)
-  timeout $XT chroot /l2r env $SHIM VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu 1,start=0,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp X_wg
+  timeout -s KILL $XT chroot /l2r env $SHIM VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu 1,start=0,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp X_wg
   K put vs-$RUN-xdone-0 1; sleep 3; tail -3 home.log | sed 's/^/[X_wg-home] /'; pkill -f "dsm home"; wg show wg0 | grep transfer
 else
   K wait vs-$RUN-home- 1 2400 >/dev/null
-  timeout $XT chroot /l2r env $SHIM VEIL_DSM_HOME=10.88.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path veilB -append "$GA" -local-cpu 1,start=1,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4445,server,nowait > ap_x.log 2>&1 &
+  timeout -s KILL $XT chroot /l2r env $SHIM VEIL_DSM_HOME=10.88.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path veilB -append "$GA" -local-cpu 1,start=1,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4445,server,nowait > ap_x.log 2>&1 &
   QP=$!; K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 5; kill $QP 2>/dev/null; grep -aE "DSM|RTT|kvmclock|rror" ap_x.log | tail -6 | sed 's/^/[X_wg-ap] /'
 fi
