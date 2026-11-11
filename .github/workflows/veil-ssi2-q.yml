@@ -1,0 +1,12 @@
+name: veil-ssi2-q
+on: {workflow_dispatch: {}}
+permissions: {contents: read}
+jobs:
+  qbuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo chmod 666 /dev/kvm; bash gha/ssi2_qbuild.sh
+      - uses: actions/upload-artifact@v4
+        with: {name: qemu-gvm, path: out/, retention-days: 1, if-no-files-found: ignore}
