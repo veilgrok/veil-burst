@@ -6,7 +6,7 @@ if [ "$G" = "0" ]; then
   t=$(date +%s)
   docker run --rm -v $W/gvm:/g -w /g/Linux-DSM-4.18 ubuntu:18.04 bash -c '
     export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null; apt-get -qq install -y build-essential flex bison libelf-dev libssl-dev bc kmod >/dev/null
-    gcc --version | head -1; make -s defconfig; ./scripts/config -e KVM -e KVM_AMD -e KVM_INTEL -e VIRTIO_PCI -e VIRTIO_NET -e BLK_DEV_INITRD -e DEVTMPFS -e DEVTMPFS_MOUNT -e KVM_DSM -e KTCP_NETWORK -d KRDMA_NETWORK; make -s olddefconfig
+    gcc --version | head -1; make -s defconfig; ./scripts/config -e KVM -e KVM_AMD -e KVM_INTEL -e VIRTIO_PCI -e VIRTIO_NET -e BLK_DEV_INITRD -e DEVTMPFS -e DEVTMPFS_MOUNT -e KVM_DSM -e KTCP_NETWORK -d KRDMA_NETWORK -e INFINIBAND -e INFINIBAND_ADDR_TRANS -e INFINIBAND_USER_ACCESS; make -s olddefconfig
     grep -E "^CONFIG_KVM(_AMD|_INTEL|_DSM)?=|KTCP|KRDMA" .config | head -8
     make -s -j$(nproc) bzImage > /g/kbuild.log 2>&1; echo rc=$?' 2>&1 | tail -12
   K=$W/gvm/Linux-DSM-4.18/arch/x86/boot/bzImage
@@ -22,7 +22,7 @@ if [ "$G" = "0" ]; then
   fi
 else
   t=$(date +%s)
-  docker run --rm -v $W/gvm:/g -w /g/QEMU-gvm-vcpupin ubuntu:18.04 bash -c '
+  docker run --rm -v $W/gvm:/g -w /g/QEMU-gvm-vcpupin ubuntu:16.04 bash -c '
     export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null; apt-get -qq install -y build-essential python pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev 2>&1 | tail -3; pkg-config --modversion glib-2.0
     ./configure --target-list=x86_64-softmmu --disable-werror > /g/qconf.log 2>&1; echo configure_rc=$?; tail -25 /g/qconf.log; which pkg-config; pkg-config --libs glib-2.0; make -s -j$(nproc) > /g/qbuild.log 2>&1; echo rc=$?
     ls -la x86_64-softmmu/qemu-system-x86_64 2>&1; x86_64-softmmu/qemu-system-x86_64 --version 2>&1 | head -1; x86_64-softmmu/qemu-system-x86_64 -help 2>&1 | grep -iE "local-cpu|dsm|gvm|router|cluster" | head -5' 2>&1 | tail -10
