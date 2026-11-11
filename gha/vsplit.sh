@@ -51,7 +51,7 @@ print(d.decode(errors="replace"))
 PY
   done; tail -2 home.log 2>/dev/null | sed "s/^/HOME t=$t /" | while IFS= read -r x; do L "$x"; done; done; }
 run_split_local() { n=$1; shm0=$2; shm1=$3; env0=$4; T0=$(date +%s.%N); rm -f /dev/shm/veil*
-  [ -n "$env0" ] && { VEIL_DSM_PREFILL=1 timeout -s KILL ${ST:-600} ./dsm home 7910 131072 2> home.log & }
+  [ -n "$env0" ] && { VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL ${ST:-600} ./dsm home 7910 131072 2> home.log & }
   sleep 0.5; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path $shm1 -append "$GA" -local-cpu 1,start=1,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4445,server,nowait > ap_$n.log 2>&1 &
   sleep 1; (WATCHT="60 180 400" watch_mon 4444 4445 &) ; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path $shm0 -append "$GA" -local-cpu 1,start=0,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $n
   wait; grep -a "DSM node1" ap_$n.log | tail -1 | sed "s/^/[$n-ap] /"; [ -n "$env0" ] && tail -3 home.log | sed "s/^/[$n-home] /"; pkill -f "dsm home" ; pkill -9 -f opt/gvm/qemu; L "CFG_END $n"; }
@@ -77,7 +77,7 @@ ip addr add 10.88.0.$((G+1))/24 dev wg0; ip link set wg0 mtu 1420 up; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
 rm -f /dev/shm/veil*; T0=$(date +%s.%N); XT=${XT:-1800}
 if [ $G = 0 ]; then
-  VEIL_DSM_PREFILL=1 timeout -s KILL $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
+  VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
   (WATCHT="120 300 600 900 1200 1500" watch_mon 4444 &)
   timeout -s KILL $XT chroot /l2r env $SHIM VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu 1,start=0,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp X_wg
   K put vs-$RUN-xdone-0 1; sleep 3; tail -3 home.log | sed 's/^/[X_wg-home] /'; pkill -f "dsm home"; wg show wg0 | grep transfer
