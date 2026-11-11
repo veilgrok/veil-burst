@@ -4,16 +4,22 @@ llama.cpp + torch train step + /dev/kvm microVM starts. Prints FINAL_JSON lines.
 Uses no secrets. Downloads only public artifacts."""
 import json, os, re, shutil, subprocess as sp, sys, threading, time, glob, statistics as st
 G = int(os.environ.get("GIDX", "0")); T0 = float(os.environ.get("T0", "0") or 0); QUICK = os.environ.get("QUICK") == "1"
-W = os.path.expanduser("~/fp"); os.makedirs(W, exist_ok=True); os.chdir(W)
+HERE = os.path.dirname(os.path.abspath(__file__)); W = os.path.expanduser("~/fp"); os.makedirs(W, exist_ok=True); os.chdir(W)
 NP = os.cpu_count()
 def J(kind, **kw):
     kw.update(kind=kind, gidx=G, t=time.time()); print("FINAL_JSON " + json.dumps(kw), flush=True)
 def sh(c, t=600, env=None):
+    # Own process group so a timeout kills every child (avoids pipe-held hangs).
+    import signal
+    p = sp.Popen(c, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, env=env, start_new_session=True)
     try:
-        r = sp.run(c, shell=True, capture_output=True, text=True, timeout=t, env=env)
-        return r.returncode, r.stdout + r.stderr
-    except sp.TimeoutExpired as e:
-        return 124, (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out, _ = p.communicate(timeout=t); return p.returncode, out
+    except sp.TimeoutExpired:
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except Exception: pass
+        try: out, _ = p.communicate(timeout=10)
+        except Exception: out = ""
+        return 124, (out or "") + "\nTIMEOUT"
 def wait_until(off, name):
     tgt = T0 + off; now = time.time()
     if T0 and now < tgt: time.sleep(tgt - now)
@@ -47,8 +53,8 @@ def pip():
     t = time.time(); rc, out = sh("python3 -m venv ~/fp/venv && ~/fp/venv/bin/pip -q install numpy && ~/fp/venv/bin/pip -q install torch --index-url https://download.pytorch.org/whl/cpu", 900)
     setup["pip"] = {"rc": rc, "s": round(time.time() - t, 1), "err": out[-300:] if rc else ""}
 def tmb():
-    t = time.time(); rc, out = sh("git clone -q --depth 1 https://github.com/ssvb/tinymembench && make -s -C tinymembench", 300)
-    setup["tinymembench"] = {"rc": rc, "s": round(time.time() - t, 1)}
+    t = time.time(); rc, out = sh(f"gcc -O2 {HERE}/memlat.c -o memlat", 120)
+    setup["memlat_build"] = {"rc": rc, "s": round(time.time() - t, 1)}
 th = [threading.Thread(target=dl, args=(k,)) for k in ["gb6", "gb7", "llama", "fc", "vmlinux", "stream"] + MODELS] + [threading.Thread(target=pip), threading.Thread(target=tmb)]
 t_setup = time.time(); [x.start() for x in th]; [x.join() for x in th]
 sh("mkdir -p gb6 gb7 llama fc && tar xzf gb6.dl -C gb6 --strip-components=1 && tar xzf gb7.dl -C gb7 --strip-components=1 && tar xzf llama.dl -C llama && tar xzf fc.dl -C fc", 300)
@@ -59,16 +65,20 @@ PY = os.path.expanduser("~/fp/venv/bin/python")
 def gb(ver, d):
     b = glob.glob(f"{d}/geekbench{ver}")
     if not b: return J(f"gb{ver}", ok=False, err="binary missing", files=os.listdir(d)[:20] if os.path.isdir(d) else [])
-    t = time.time(); rc, out = sh(f"cd {d} && ./geekbench{ver} --cpu", 1500); dt = time.time() - t
+    t = time.time(); rc, out = sh(f"cd {d} && ./geekbench{ver} --cpu", 1200); dt = time.time() - t
+    if rc != 0 and "internal code" in out:
+        J(f"gb{ver}_retry", first_tail=out[-200:])
+        e = dict(os.environ, SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt", SSL_CERT_DIR="/etc/ssl/certs", CURL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt")
+        t = time.time(); rc, out = sh(f"cd {d} && ./geekbench{ver} --cpu", 1200, env=e); dt = time.time() - t
     url = re.findall(r"https://browser\.geekbench\.com/v\d/cpu/\d+", out)
     sc = re.search(r"Single-Core Score\s+(\d+)", out); mc = re.search(r"Multi-Core Score\s+(\d+)", out)
     J(f"gb{ver}", ok=rc == 0, rc=rc, wall_s=round(dt, 1), url=url[0] if url else None, single=int(sc.group(1)) if sc else None,
       multi=int(mc.group(1)) if mc else None, tail=out[-600:] if (rc or not url) else "")
 wait_until(0, "gb6"); gb(6, "gb6")
-wait_until(0 if QUICK else 540, "gb7"); gb(7, "gb7")
+wait_until(0 if QUICK else 600, "gb7"); gb(7, "gb7")
 
 # ---- SGEMM / vector math / ML (T0+20min)
-wait_until(0 if QUICK else 1200, "compute")
+wait_until(0 if QUICK else 1260, "compute")
 open("compute.py", "w").write(r'''
 import json, os, time, numpy as np
 out = {"numpy": np.__version__}
@@ -119,10 +129,9 @@ for thr in [NP, 1]:
     rc, out = sh(f"OMP_NUM_THREADS={thr} ./stream_bin", 300)
     res[f"t{thr}"] = {k: float(v) for k, v in re.findall(r"^(Copy|Scale|Add|Triad):\s+([\d.]+)", out, re.M)}
 J("stream", unit="MB/s best rate", array_elems=100000000, **res)
-rc, out = sh("./tinymembench/tinymembench", 600)
-lat = re.findall(r"^\s*(\d+) : +([\d.]+) ns +/ +([\d.]+) ns", out, re.M)
-J("memlat", ok=bool(lat), rows=[{"kb": int(a), "ns_single": float(b), "ns_dual": float(c)} for a, b, c in lat][-6:],
-  memcpy=re.findall(r"^ C copy\s+:\s+([\d.]+) MB/s", out, re.M)[:1])
+rc, out = sh("./memlat", 300)
+lat = re.findall(r"^LAT (\d+) ([\d.]+)", out, re.M)
+J("memlat", ok=bool(lat), method="pointer chase, random 64B lines, 2e7 loads", rows=[{"kb": int(a), "ns_single": float(b)} for a, b in lat])
 
 # ---- llama.cpp
 lb = glob.glob("llama/**/llama-bench", recursive=True)
