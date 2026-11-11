@@ -17,6 +17,7 @@ for a,b in itertools.combinations(sorted(n),2):
   if best is None or sc>best[0]: best=(sc,a,b)
 print(best[1],best[2] if best else '')")
   read PA PB <<< "$SEL"; J "{\"kind\":\"pick\",\"gidx\":$GI,\"pair\":\"$PA $PB\",\"all\":$(echo "$ALL" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')}"
+  if [ "${REQINTEL:-0}" = 1 ]; then NI=$(echo "$ALL" | python3 -c "import json,sys;d=json.load(sys.stdin);print(sum(1 for k,v in d.items() if k.rsplit('-',1)[1] in '$PA $PB'.split() and int(v.split()[0])>0))"); [ "$NI" = 2 ] || { J "{\"kind\":\"no_intel_pair\",\"gidx\":$GI}"; exit 0; }; fi
   if [ "$GI" = "$PA" ]; then G=0; MODE=pair; elif [ "$GI" = "$PB" ]; then G=1; MODE=pair; else echo "not picked"; exit 0; fi
 fi
 J "{\"kind\":\"role\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
@@ -33,7 +34,10 @@ sudo ip link add wg0 type wireguard; sudo wg set wg0 listen-port 51820 private-k
 sudo ip addr add 10.88.0.$((G+1))/24 dev wg0; sudo ip link set wg0 up; sudo ip link set wg0 mtu ${WGMTU:-1420}; sudo ip route add 10.89.0.$((P+1))/32 dev wg0
 sudo wg show wg0 | grep -E "endpoint|handshake|transfer"; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
-J "{\"kind\":\"wg_bigping\",\"gidx\":$G,\"mtu\":${WGMTU:-1420},\"out\":\"$(ping -c 10 -i 0.2 -s 4200 -M do 10.88.0.$((P+1)) 2>&1 | tail -1)\"}"
+sudo ip link set wg0 mtu 8920
+for df in do dont; do o=$(ping -c 10 -i 0.2 -W 2 -s 4200 -M $df 10.88.0.$((P+1)) 2>&1 | grep -E "packets transmitted|rtt|error|too long" | tr '\n' ';' | tr -d '"'); J "{\"kind\":\"wg_bigping\",\"gidx\":$G,\"wg_mtu\":8920,\"size\":4200,\"df\":\"$df\",\"out\":\"$o\"}"; done
+o=$(ping -c 5 -i 0.2 -W 2 -s 1372 -M do 10.88.0.$((P+1)) 2>&1 | grep -E "packets transmitted" | tr -d '"'); J "{\"kind\":\"wg_bigping\",\"gidx\":$G,\"wg_mtu\":8920,\"size\":1372,\"df\":\"do\",\"out\":\"$o\"}"
+sudo ip link set wg0 mtu ${WGMTU:-1420}
 fi
 sudo sysctl -qw net.ipv4.ip_forward=1; sudo iptables -I FORWARD -j ACCEPT
 mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.90.$1.1/24 dev tap$1; sudo ip link set tap$1 mtu ${TAPMTU:-1500} up; sudo ip route add 10.89.0.$(($1+1))/32 dev tap$1; }
