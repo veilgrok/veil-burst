@@ -17,7 +17,7 @@ for a,b in itertools.combinations(sorted(n),2):
   if best is None or sc>best[0]: best=(sc,a,b)
 print(best[1],best[2] if best else '')")
   read PA PB <<< "$SEL"; J "{\"kind\":\"pick\",\"gidx\":$GI,\"pair\":\"$PA $PB\",\"all\":$(echo "$ALL" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')}"
-  if [ "${REQINTEL:-0}" = 1 ]; then NI=$(echo "$ALL" | python3 -c "import json,sys;d=json.load(sys.stdin);print(sum(1 for k,v in d.items() if k.rsplit('-',1)[1] in '$PA $PB'.split() and int(v.split()[0])>0))"); [ "$NI" = 2 ] || { J "{\"kind\":\"no_intel_pair\",\"gidx\":$GI}"; exit 0; }; fi
+  if [ "${REQINTEL:-0}" = 1 ]; then NI=$(echo "$ALL" | python3 -c "import json,sys;d=json.load(sys.stdin);p=[v.split() for k,v in d.items() if k.rsplit('-',1)[1] in '$PA $PB'.split()];print(2 if len(p)==2 and all(int(x[0])>0 for x in p) and p[0][1:]==p[1][1:] else 0)"); [ "$NI" = 2 ] || { J "{\"kind\":\"no_intel_pair\",\"gidx\":$GI}"; exit 0; }; fi
   if [ "$GI" = "$PA" ]; then G=0; MODE=pair; elif [ "$GI" = "$PB" ]; then G=1; MODE=pair; else echo "not picked"; exit 0; fi
 fi
 J "{\"kind\":\"role\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
