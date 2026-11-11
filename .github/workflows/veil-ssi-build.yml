@@ -1,0 +1,19 @@
+name: veil-ssi-build
+on:
+  workflow_dispatch:
+    inputs:
+      chisel_url: {required: true, type: string}
+permissions: {contents: read}
+jobs:
+  probe:
+    strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: ssi probe
+        env:
+          GIDX: ${{ matrix.gidx }}
+          CHISEL_URL: ${{ inputs.chisel_url }}
+          CHISEL_AUTH: ${{ secrets.CHISEL_AUTH }}
+        run: bash gha/ssi_build.sh
