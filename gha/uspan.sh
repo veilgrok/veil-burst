@@ -54,7 +54,7 @@ for c in ${CFGSU:-U_memfd U_uffd U_rem U_rem_evict U_memfd2 U_uffd2 U_rem2}; do 
  U_memfd|U_memfd2) runU $c X=1;;
  U_uffd|U_uffd2) runU $c $SH;;
  U_rem|U_rem2) runU $c $SH VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=0;;
- U_pipe_*|U_pev_*) IFS=_ read -r _ kind b r e <<< "$c"; RESMB=0; [ $kind = pev ] && RESMB=${e#e}; runU $c $SH VEIL_UFFD_PIPE=1 VEIL_UFFD_BATCH=${b#b} VEIL_UFFD_RA=${r#ra} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=$RESMB;;
+ U_pipe_*|U_pev_*) IFS=_ read -r _ kind b r e <<< "$c"; RESMB=0; [ $kind = pev ] && RESMB=${e#e}; RESMB=${RESMB%%_*}; runU $c $SH VEIL_UFFD_PIPE=1 VEIL_UFFD_BATCH=${b#b} VEIL_UFFD_RA=${r#ra} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=$RESMB;;
  U_rem_b*) runU $c $SH VEIL_UFFD_BATCH=${c#U_rem_b} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=0;;
  U_rem_evict*) runU $c $SH VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=${RES:-128};;
 esac; done

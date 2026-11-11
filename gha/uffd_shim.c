@@ -35,16 +35,21 @@ static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); r
 /* ---- pipelined remote path (VEIL_UFFD_PIPE=1): pager only sends requests; a receiver thread installs chunks as they stream back.
    chunk = rbatch pages of the remote range; readahead keeps up to `ra` following chunks in flight; resident budget counted in chunks. */
 static int pipe_on, ra = 8; static uint8_t *cst; static double *cfault; static size_t nchunks, *cfifo, cfh, cft, cfcap, nres; static pthread_mutex_t smu = PTHREAD_MUTEX_INITIALIZER;
-static unsigned long ndemand, nhit_inflight, nhit_done, nreq, nstall; static double stall_sum;
+static unsigned long ndata, nzero, ndemand, nhit_inflight, nhit_done, nreq, nstall; static double stall_sum;
 static uint64_t coff(size_t c) { return split + (uint64_t)c * rbatch * PS; }
 static uint32_t clen(size_t c) { uint64_t o = coff(c), e = o + (uint64_t)rbatch * PS; if (e > blen) e = blen; return (e - o) / PS; }
 static void send_req(size_t c) { char q[13]; uint64_t o = coff(c); uint32_t n = clen(c); q[0] = 'Q'; memcpy(q + 1, &o, 8); memcpy(q + 9, &n, 4); if (xfer(rs, q, 13, 1)) perror("UFFD req"); nreq++; }
 static void *recv_thr(void *a) {
   char *buf = aligned_alloc(PS, (size_t)rbatch * PS);
-  for (;;) { uint64_t o; uint32_t n; if (xfer(rs, &o, 8, 0) || xfer(rs, &n, 4, 0) || xfer(rs, buf, (size_t)n * PS, 0)) { perror("UFFD recv"); return 0; }
-    struct uffdio_copy c = {.dst = (uintptr_t)base + o, .src = (uintptr_t)buf, .len = (uint64_t)n * PS, .mode = 0};
-    if (ioctl(uffd, UFFDIO_COPY, &c)) { for (uint32_t i = 0; i < n; i++) { struct uffdio_copy d = {.dst = (uintptr_t)base + o + (uint64_t)i * PS, .src = (uintptr_t)buf + (size_t)i * PS, .len = PS, .mode = 0}; ioctl(uffd, UFFDIO_COPY, &d); }
-      struct uffdio_range w = {(uintptr_t)base + o, (uint64_t)n * PS}; ioctl(uffd, UFFDIO_WAKE, &w); }
+  static char zero4k[4096] __attribute__((aligned(4096)));
+  for (;;) { uint64_t o, mask; uint32_t n; if (xfer(rs, &o, 8, 0) || xfer(rs, &n, 4, 0) || xfer(rs, &mask, 8, 0)) { perror("UFFD recv"); return 0; }
+    int nd = __builtin_popcountll(mask); if (nd && xfer(rs, buf, (size_t)nd * PS, 0)) { perror("UFFD recv"); return 0; } ndata += nd; nzero += n - nd;
+    size_t bi = 0; for (uint32_t i = 0; i < n;) { int d = mask >> i & 1; uint32_t j = i; while (j < n && (int)(mask >> j & 1) == d) j++;  /* run [i,j) of same kind */
+      uint64_t dst = (uintptr_t)base + o + (uint64_t)i * PS, len = (uint64_t)(j - i) * PS;
+      if (d) { struct uffdio_copy c = {.dst = dst, .src = (uintptr_t)buf + bi * PS, .len = len, .mode = UFFDIO_COPY_MODE_DONTWAKE}; if (ioctl(uffd, UFFDIO_COPY, &c)) for (uint32_t k = 0; k < j - i; k++) { struct uffdio_copy e = {.dst = dst + k * PS, .src = (uintptr_t)buf + (bi + k) * PS, .len = PS, .mode = UFFDIO_COPY_MODE_DONTWAKE}; ioctl(uffd, UFFDIO_COPY, &e); } bi += j - i; }
+      else { struct uffdio_zeropage z = {.range = {dst, len}, .mode = UFFDIO_ZEROPAGE_MODE_DONTWAKE}; if (ioctl(uffd, UFFDIO_ZEROPAGE, &z)) for (uint32_t k = 0; k < j - i; k++) { struct uffdio_copy e = {.dst = dst + k * PS, .src = (uintptr_t)zero4k, .len = PS, .mode = UFFDIO_COPY_MODE_DONTWAKE}; ioctl(uffd, UFFDIO_COPY, &e); } }
+      i = j; }
+    { struct uffdio_range w = {(uintptr_t)base + o, (uint64_t)n * PS}; ioctl(uffd, UFFDIO_WAKE, &w); }
     size_t ci = (o - split) / ((uint64_t)rbatch * PS);
     pthread_mutex_lock(&smu); cst[ci] = 2; if (cfault[ci] > 0) { stall_sum += now() - cfault[ci]; nstall++; cfault[ci] = 0; } if (cfcap) cfifo[cft++ % (cfcap + 64)] = ci; pthread_mutex_unlock(&smu); nprefetch += n; }
 }
@@ -61,11 +66,11 @@ static void pipe_fault(uint64_t off, uint64_t dst) {
   if (cst[c] == 0) { cst[c] = 1; cfault[c] = now(); ndemand++; want[nw++] = c; nres++; }
   else if (cst[c] == 1) { if (cfault[c] == 0) cfault[c] = now(); nhit_inflight++; }
   else { nhit_done++; struct uffdio_range w = {dst, PS}; ioctl(uffd, UFFDIO_WAKE, &w); }
-  for (int k = 1; k <= ra && nw < 64; k++) { size_t d = c + k; if (d >= nchunks) break; if (cst[d] == 0 && (!cfcap || nres + 1 < cfcap)) { cst[d] = 1; want[nw++] = d; nres++; } }
+  int rae = cfcap && (size_t)ra > cfcap / 32 ? (int)(cfcap / 32) : ra; for (int k = 1; k <= rae && nw < 64; k++) { size_t d = c + k; if (d >= nchunks) break; if (cst[d] == 0 && (!cfcap || nres + 1 < cfcap)) { cst[d] = 1; want[nw++] = d; nres++; } }
   pthread_mutex_unlock(&smu);
   while (cfcap && nres > cfcap) pipe_evict_one();
   for (int i = 0; i < nw; i++) send_req(want[i]);
-  if (cfcap) while (nres + ra > cfcap && cft > cfh) pipe_evict_one();
+  if (cfcap) while (nres + rae > cfcap && cft > cfh) pipe_evict_one();
 }
 static void *pager(void *a) {
   long ps = sysconf(_SC_PAGESIZE); char *zero = aligned_alloc(ps, ps); memset(zero, 0, ps);
@@ -102,7 +107,7 @@ static void *pager(void *a) {
       clock_gettime(CLOCK_MONOTONIC, &t1); long dt = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
       nfault++; nserve_ns += dt; if (remote) { nremote++; remote_ns += dt; } else nlocal++;
     }
-    if (now() - last > 5) { last = now(); fprintf(stderr, "UFFD faults=%lu local=%lu remote=%lu evict=%lu serve_ms=%.1f remote_avg_us=%.1f evict_avg_us=%.1f prefetched=%lu wp_faults=%lu wp_err=%lu mapped_MiB=%zu\n", nfault, nlocal, nremote, nevict, nserve_ns / 1e6, nremote ? remote_ns / 1e3 / nremote : 0, nevict ? evict_ns / 1e3 / nevict : 0, nprefetch, nwp, nwperr, blen >> 20); if (pipe_on) fprintf(stderr, "UFFD pipe demand=%lu hit_inflight=%lu hit_done=%lu req=%lu stall_n=%lu stall_avg_us=%.1f resident_chunks=%zu\n", ndemand, nhit_inflight, nhit_done, nreq, nstall, nstall ? stall_sum * 1e6 / nstall : 0, nres); }
+    if (now() - last > 5) { last = now(); fprintf(stderr, "UFFD faults=%lu local=%lu remote=%lu evict=%lu serve_ms=%.1f remote_avg_us=%.1f evict_avg_us=%.1f prefetched=%lu wp_faults=%lu wp_err=%lu mapped_MiB=%zu\n", nfault, nlocal, nremote, nevict, nserve_ns / 1e6, nremote ? remote_ns / 1e3 / nremote : 0, nevict ? evict_ns / 1e3 / nevict : 0, nprefetch, nwp, nwperr, blen >> 20); if (pipe_on) fprintf(stderr, "UFFD pipe data_pages=%lu zero_pages=%lu demand=%lu hit_inflight=%lu hit_done=%lu req=%lu stall_n=%lu stall_avg_us=%.1f resident_chunks=%zu\n", ndata, nzero, ndemand, nhit_inflight, nhit_done, nreq, nstall, nstall ? stall_sum * 1e6 / nstall : 0, nres); }
   }
   return 0;
 }
@@ -119,7 +124,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
         struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_MISSING_SHMEM | (want_wp ? UFFD_FEATURE_WP_HUGETLBFS_SHMEM : 0)};
         struct uffdio_register reg = {.range = {(uintptr_t)p, len}, .mode = UFFDIO_REGISTER_MODE_MISSING | (want_wp ? UFFDIO_REGISTER_MODE_WP : 0)};
         if (uffd >= 0 && ioctl(uffd, UFFDIO_API, &api) && want_wp) { close(uffd); uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK); api.features = UFFD_FEATURE_MISSING_SHMEM; reg.mode = UFFDIO_REGISTER_MODE_MISSING; want_wp = 0; ioctl(uffd, UFFDIO_API, &api); }
-        wpok = want_wp; if (getenv("VEIL_UFFD_BATCH")) rbatch = atoi(getenv("VEIL_UFFD_BATCH")); if (getenv("VEIL_UFFD_LBATCH")) lbatch = atoi(getenv("VEIL_UFFD_LBATCH")); if (rbatch < 1) rbatch = 1; if (lbatch < 1) lbatch = 1;
+        wpok = want_wp; if (getenv("VEIL_UFFD_BATCH")) rbatch = atoi(getenv("VEIL_UFFD_BATCH")); if (getenv("VEIL_UFFD_LBATCH")) lbatch = atoi(getenv("VEIL_UFFD_LBATCH")); if (rbatch < 1) rbatch = 1; if (rbatch > 64) rbatch = 64; if (lbatch < 1) lbatch = 1;
         if (uffd < 0 || ioctl(uffd, UFFDIO_REGISTER, &reg)) { perror("UFFD setup"); }
         else { base = p; blen = len; memfd = dup(fd); PS = sysconf(_SC_PAGESIZE); rbuf = aligned_alloc(PS, (size_t)rbatch * PS);
           const char *r = getenv("VEIL_UFFD_REMOTE"); split = (size_t)atol(getenv("VEIL_UFFD_SPLIT_MB") ? getenv("VEIL_UFFD_SPLIT_MB") : "0") << 20; rbudget = (size_t)atol(getenv("VEIL_UFFD_RESIDENT_MB") ? getenv("VEIL_UFFD_RESIDENT_MB") : "0") << 20;
@@ -134,3 +139,6 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
 }
 void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) __attribute__((alias("mmap")));
 __attribute__((constructor)) static void hello(void) { if (getenv("VEIL_UFFD_MATCH")) fprintf(stderr, "UFFD shim loaded pid=%d\n", getpid()); }
+
+__attribute__((destructor)) static void bye(void) { if (uffd < 0) return; fprintf(stderr, "UFFD FINAL faults=%lu local=%lu remote=%lu evict=%lu serve_ms=%.1f remote_avg_us=%.1f evict_avg_us=%.1f prefetched=%lu wp_faults=%lu\n", nfault, nlocal, nremote, nevict, nserve_ns / 1e6, nremote && !pipe_on ? remote_ns / 1e3 / nremote : 0, nevict ? evict_ns / 1e3 / nevict : 0, nprefetch, nwp);
+  if (pipe_on) fprintf(stderr, "UFFD FINAL pipe data_pages=%lu zero_pages=%lu demand=%lu hit_inflight=%lu hit_done=%lu req=%lu stall_n=%lu stall_avg_us=%.1f\n", ndata, nzero, ndemand, nhit_inflight, nhit_done, nreq, nstall, nstall ? stall_sum * 1e6 / nstall : 0); }
