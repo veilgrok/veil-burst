@@ -5,7 +5,7 @@ import http.client, json, os, select, socket, struct, subprocess, sys, time, url
 G = int(os.environ["GIDX"]); N = int(os.environ["NPEERS"]); RUN = os.environ["GITHUB_RUN_ID"]
 u = urllib.parse.urlparse(os.environ["VEIL_RELAY_URL"]); H = {"X-Token": os.environ["VEIL_RELAY_TOKEN"], "X-Runner": f"p2p{G}"}
 def J(o): print("VEIL_JSON " + json.dumps(o), flush=True)
-def http(m, path, body=None):
+def req(m, path, body=None):
     c = http.client.HTTPSConnection(u.netloc, timeout=30); c.request(m, path, body=body, headers=H); r = c.getresponse().read(); c.close(); return r
 def stun(sock, host, port):
     tx = os.urandom(12); sock.sendto(struct.pack("!HHI", 1, 0, 0x2112A442) + tx, (host, port)); end = time.time() + 3
@@ -28,10 +28,10 @@ us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); us.bind(("0.0.0.0", 47002
 m1 = stun(us, "stun.l.google.com", 19302); m2 = stun(us, "stun.cloudflare.com", 3478)
 me = {"g": G, "priv": priv, "pub": m1[0] if m1 else None, "port": m1[1] if m1 else None, "port2": m2[1] if m2 else None}
 J({"kind": "p2p_self", **me, "nat_endpoint_independent": bool(m1 and m2 and m1 == m2)})
-http("POST", f"/kv/p2p-{RUN}-{G}", json.dumps(me).encode())
+req("POST", f"/kv/p2p-{RUN}-{G}", json.dumps(me).encode())
 peers = {}; end = time.time() + 150
 while time.time() < end and len(peers) < N - 1:
-    d = json.loads(http("GET", f"/kv/p2p-{RUN}-")); peers = {int(k.rsplit("-", 1)[1]): json.loads(v) for k, v in d.items() if not k.endswith(f"-{G}")}; time.sleep(2)
+    d = json.loads(req("GET", f"/kv/p2p-{RUN}-")); peers = {int(k.rsplit("-", 1)[1]): json.loads(v) for k, v in d.items() if not k.endswith(f"-{G}")}; time.sleep(2)
 J({"kind": "p2p_peers", "g": G, "n": len(peers)})
 conns = []
 def serve(t):

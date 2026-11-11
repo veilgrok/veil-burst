@@ -1,0 +1,24 @@
+name: veil-p2p
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url: {required: true, type: string}
+      n: {required: false, default: "[0,1,2,3,4,5]", type: string}
+      npeers: {required: false, default: "6", type: string}
+permissions: {contents: read}
+jobs:
+  p2p:
+    strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: p2p
+        env:
+          GIDX: ${{ matrix.gidx }}
+          NPEERS: ${{ inputs.npeers }}
+          VEIL_RELAY_URL: ${{ inputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: |
+          echo "VEIL_JSON {\"kind\":\"where\",\"gidx\":$GIDX,\"cpu\":\"$(lscpu | sed -n 's/Model name: *//p' | head -1)\",\"region\":\"$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')\"}"
+          timeout 300 python3 gha/netp2p.py
