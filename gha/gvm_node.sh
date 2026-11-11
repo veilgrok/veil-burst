@@ -30,9 +30,10 @@ K put gvm-$RUN-wg-$G "{\"ip\":\"$MIP\",\"port\":$MPORT,\"pub\":\"$PUB\"}"
 PEER=$(K wait gvm-$RUN-wg- 2 300) || { echo "peer never arrived"; exit 1; }
 read PIP PPORT PPUB < <(echo "$PEER" | python3 -c "import json,sys;d=json.load(sys.stdin);p=json.loads(d['gvm-$RUN-wg-$P']);print(p['ip'],p['port'],p['pub'])")
 sudo ip link add wg0 type wireguard; sudo wg set wg0 listen-port 51820 private-key /etc/wireguard/k peer $PPUB endpoint $PIP:$PPORT allowed-ips 10.88.0.$((P+1))/32,10.89.0.$((P+1))/32 persistent-keepalive 1
-sudo ip addr add 10.88.0.$((G+1))/24 dev wg0; sudo ip link set wg0 up; sudo ip route add 10.89.0.$((P+1))/32 dev wg0
+sudo ip addr add 10.88.0.$((G+1))/24 dev wg0; sudo ip link set wg0 up; sudo ip link set wg0 mtu ${WGMTU:-1420}; sudo ip route add 10.89.0.$((P+1))/32 dev wg0
 sudo wg show wg0 | grep -E "endpoint|handshake|transfer"; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
+J "{\"kind\":\"wg_bigping\",\"gidx\":$G,\"mtu\":${WGMTU:-1420},\"out\":\"$(ping -c 10 -i 0.2 -s 4200 -M do 10.88.0.$((P+1)) 2>&1 | tail -1)\"}"
 fi
 sudo sysctl -qw net.ipv4.ip_forward=1; sudo iptables -I FORWARD -j ACCEPT
 mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.90.$1.1/24 dev tap$1; sudo ip link set tap$1 mtu ${TAPMTU:-1500} up; sudo ip route add 10.89.0.$(($1+1))/32 dev tap$1; }
@@ -75,7 +76,7 @@ sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -
 runl2() { timeout ${L2T:-1000} qemu-system-x86_64 -enable-kvm -cpu host -smp $2 -m $3 -kernel art/bzImage -initrd l2_$1.gz -append "console=ttyS0 rdinit=/init panic=-1" -nographic -no-reboot \
   -netdev tap,id=n0,ifname=tap$1,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=n0,mac=52:54:00:00:00:1$1 2>&1 | tee l2_$1.log | grep -a --line-buffered -E "^(L2|L3|GVM|B1|B2|BASE|WATCH|MON|TASK|  STK|DSM)|panic" | sed -u "s/^/[n$1] /"; }
 if [ $MODE = pair ]; then
-  mktap $G; mk_l2 $G 1 1; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
+  export TAPMTU=$(( ${WGMTU:-1420} > 1500 ? ${WGMTU:-1420} - 100 : 1500 )); mktap $G; mk_l2 $G 1 1; K put gvm-$RUN-ready-$G 1; K wait gvm-$RUN-ready- 2 300 >/dev/null
   runl2 $G 4 12288
 else  # solo Intel runner: two GiantVM nodes as two L2 hosts on this runner (honest label: same physical runner)
   export TAPMTU=9000; mktap 0; mktap 1; mk_l2 0 1 1; mk_l2 1 1 1
