@@ -6,13 +6,14 @@ REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/co
 if [ "${NN:-2}" -gt 2 ]; then
   V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd); K put vs-$RUN-reg-$G "$REG|$V"; ALL=$(K wait vs-$RUN-reg- $NN 300) || ALL=$(K wait vs-$RUN-reg- 2 5)
   read PA PB <<< "$(echo "$ALL" | python3 -c "
-import json,sys; d={int(k.rsplit('-',1)[1]):v for k,v in json.load(sys.stdin).items()}; ks=sorted(d); p=None
+import json,sys; d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; ks=sorted(d); p=None
 for want in ('intel',None):  # prefer a same-region Intel pair (eptad=0 removes page-table walk writes)
   for i in ks:
     for j in ks:
       if j>i and d[i]==d[j] and p is None and (want is None or d[i].endswith('|intel')): p=(i,j)
-p=p or (ks[0],ks[1]); print(p[0],p[1])")"
+print(*(p or ('none','none')))")"
   J "{\"kind\":\"pick\",\"gidx\":$G,\"pair\":\"$PA $PB\"}"
+  [ "$PA" = none ] && { L0() { python3 gha/kv.py put vs-$RUN-log-x-$(date +%s%N) "$*" >/dev/null 2>&1; }; [ "$GIDX" = 0 ] && L0 "NOPAIR no same-region pair: $(echo $ALL | tr -d \"{}\")"; echo "no same-region pair"; exit 0; }
   if [ "$G" = "$PA" ]; then G=0; elif [ "$G" = "$PB" ]; then G=1; else echo "not picked"; exit 0; fi
 fi
 LQ=0; L() { echo "$*"; LQ=$((LQ+1)); (K put vs-$RUN-log-$G-$(date +%s%N) "$*" >/dev/null 2>&1 &) ; }
