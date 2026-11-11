@@ -27,16 +27,18 @@ chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
 # ---- Phase A: TWO levels. Stock QEMU on the L1 runner runs the same L3 kernel+initrd directly (it becomes an L2 guest).
 ksnap() { sudo sh -c 'for f in /sys/kernel/debug/kvm/*; do [ -f "$f" ] && echo "${f##*/} $(cat $f)"; done' 2>/dev/null; }
-runA() { n=$1; shift; echo "CFG_START $n"; timeout 300 "$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now; ksnap > /tmp/a0;; *PBENCH*) ksnap > /tmp/a1; echo "PROF $n wall_s=$(python3 -c "print(round($now-$t0,3))") $(awk 'NR==FNR{a[$1]=$2;next}{d=$2-a[$1]; if(d>0) printf "%s=%d ",$1,d}' /tmp/a0 /tmp/a1)";; esac; case "$l" in *L3*|*IRQ*|*PBENCH*|*clocksource*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
-sudo cp /boot/vmlinuz-$(uname -r) k6; sudo chmod 644 k6
+runA() { n=$1; shift; echo "CFG_START $n"; timeout 300 "$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now; ksnap > /tmp/a0;; *PBENCH*) ksnap > /tmp/a1; echo "PROF $n wall_s=$(python3 -c "print(round($now-$t0,3))") $(awk 'NR==FNR{a[$1]=$2;next}{d=$2-a[$1]; if(d>0) printf "%s=%d ",$1,d}' /tmp/a0 /tmp/a1)";; esac; case "$l" in *L3*|*IRQ*|*PBENCH*|*clocksource*|*UFFD*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
+sudo cp /boot/vmlinuz-$(uname -r) k6; sudo chmod 644 k6; gcc -O2 -shared -fPIC -o uffd_shim.so gha/uffd_shim.c -ldl -lpthread && echo STEP shim built
 A="qemu-system-x86_64 -enable-kvm -smp 1 -m 512 -initrd l3.gz"
 NA="console=ttyS0 panic=-1 noapic no_timer_check"; DF="console=ttyS0 panic=-1"
-for c in ${CFGSA:-A_on A_off_na A_host A_k6_on A_on_invtsc}; do case $c in
+for c in ${CFGSA:-A_on A_off_na A_host A_k6_on A_on_invtsc C_memfd C_uffd}; do case $c in
  A_on) runA A_on $A -kernel art/bzImage -cpu kvm64 -append "$DF";;
  A_off_na) runA A_off_na $A -kernel art/bzImage -cpu kvm64 -machine pc,kernel-irqchip=off -append "$NA";;
  A_host) runA A_host $A -kernel art/bzImage -cpu host -append "$DF";;
  A_k6_on) runA A_k6_on $A -kernel k6 -cpu host -append "$DF";;
  A_on_invtsc) runA A_on_invtsc $A -kernel art/bzImage -cpu kvm64,+invtsc -append "$DF";;
+ C_memfd) runA C_memfd $A -kernel art/bzImage -cpu kvm64 -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram -append "$DF";;
+ C_uffd) sudo sysctl -qw vm.unprivileged_userfaultfd=1; runA C_uffd env LD_PRELOAD=$PWD/uffd_shim.so VEIL_UFFD_MATCH=memfd:vram $A -kernel art/bzImage -cpu kvm64 -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram -append "$DF";;
 esac; done
 CFGS=${CFGS:-"G_off S_on S_off G_on G_on_na G_off_mlock S_on_host"}
 cat > init <<EOS
