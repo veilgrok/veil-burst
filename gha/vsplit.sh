@@ -35,7 +35,7 @@ EOI
 chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3x.gz)
 # stamp + summarize: host wall time between markers on the BSP serial
 stamp() { n=$1; while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB1_START*) a=$now;; *PB2_START*) b=$now; L "PROF $n pb1_wall_s=$(python3 -c "print(round($b-$a,3))")";; *MT_START*) c=$now; L "PROF $n pb2_wall_s=$(python3 -c "print(round($c-$b,3))")";; *XC_START*) d=$now; L "PROF $n mt_wall_s=$(python3 -c "print(round($d-$c,3))")";; *PB_DONE*) L "PROF $n xc_wall_s=$(python3 -c "print(round($now-$d,3))")"; (sleep 3; pkill -9 -f opt/gvm/qemu-system; pkill -9 -f "qemu-system-x86_64 -enable-kvm") & ;; esac
-  case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*"Total of"*|*"Command line"*|*rror*|*panic*|*DSM*|*"set kvmclock"*|*"RTT"*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
+  case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*"Total of"*|*"Command line"*|*rror*|*panic*|*DSM*|*"set kvmclock"*|*"RTT"*|*smp*|*SMP*|*CPU1*|*"x86:"*|*lockup*|*rcu*|*Stuck*|*stuck*|*NMI*|*"Run /init"*|*Freeing*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp 2 -m 512 -kernel /w/art/bzImage -initrd /w/l3x.gz -nographic -no-reboot -net none"
 GA="console=ttyS0 panic=-1 no_timer_check noapic ${GAX:-no-kvmclock}"
 SHIM="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil"
@@ -85,5 +85,5 @@ if [ $G = 0 ]; then
 else
   K wait vs-$RUN-home- 1 2400 >/dev/null
   timeout -s KILL $XT chroot /l2r env $SHIM VEIL_DSM_HOME=10.88.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path veilB -append "$GA" -local-cpu 1,start=1,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4445,server,nowait > ap_x.log 2>&1 &
-  QP=$!; K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 5; kill $QP 2>/dev/null; grep -aE "DSM|RTT|kvmclock|rror" ap_x.log | tail -6 | sed 's/^/[X_wg-ap] /'
+  QP=$!; (WATCHT="120 300 600 900 1200 1500" watch_mon 4445 &); (while sleep 60; do L "[X_ap] $(grep -a "DSM node1 faults" ap_x.log | tail -1)"; done &) ; K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 5; kill $QP 2>/dev/null; grep -aE "DSM|RTT|kvmclock|rror" ap_x.log | tail -6 | sed 's/^/[X_wg-ap] /'
 fi
