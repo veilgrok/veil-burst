@@ -4,6 +4,21 @@ set -u; GI=$GIDX; W=$GITHUB_WORKSPACE; RUN=$GITHUB_RUN_ID; J() { echo "VEIL_JSON
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$GI,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo),\"svm\":$(grep -c -w svm /proc/cpuinfo),\"region\":\"$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')\"}"
 # roles: gidx 0/1 = cross-runner pair (WireGuard), gidx 2 = two GiantVM nodes on one runner ("local pair")
 case $GI in 0) G=0; MODE=pair;; 1) G=1; MODE=pair;; *) G=0; MODE=solo;; esac; [ "${SOLO:-0}" = 1 ] && { G=0; MODE=solo; }
+if [ "${PICK:-0}" = 1 ]; then  # every runner registers; pick the best cross-runner pair: Intel+same region > Intel+Intel > any
+  REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')
+  K put gvm-$GITHUB_RUN_ID-cpu-$GI "$(grep -c -w vmx /proc/cpuinfo) $REG"
+  ALL=$(K wait gvm-$GITHUB_RUN_ID-cpu- $NNODES 240) || ALL=$(K wait gvm-$GITHUB_RUN_ID-cpu- 1 5)
+  SEL=$(echo "$ALL" | python3 -c "
+import json,sys,itertools; d=json.load(sys.stdin); n={int(k.rsplit('-',1)[1]):v.split() for k,v in d.items()}
+best=None
+for a,b in itertools.combinations(sorted(n),2):
+  ia,ib=int(n[a][0])>0,int(n[b][0])>0; same=n[a][1:]==n[b][1:]
+  sc=4*(ia and ib)+2*same+(ia or ib)
+  if best is None or sc>best[0]: best=(sc,a,b)
+print(best[1],best[2] if best else '')")
+  read PA PB <<< "$SEL"; J "{\"kind\":\"pick\",\"gidx\":$GI,\"pair\":\"$PA $PB\",\"all\":$(echo "$ALL" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')}"
+  if [ "$GI" = "$PA" ]; then G=0; MODE=pair; elif [ "$GI" = "$PB" ]; then G=1; MODE=pair; else echo "not picked"; exit 0; fi
+fi
 J "{\"kind\":\"role\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
 P=$((1-G))
 sudo apt-get -qq update >/dev/null; sudo apt-get -qq install -y wireguard-tools qemu-system-x86 busybox-static cpio >/dev/null 2>&1; sudo chmod 666 /dev/kvm; sudo modprobe vhost_net; sudo chmod 666 /dev/vhost-net
@@ -24,6 +39,7 @@ mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.
 # --- L2 userland (ubuntu18.04 + QEMU-gvm); L3 initrd uses 18.04's baseline-x86-64 busybox and a -march=x86-64 pbench
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
 if [ -x art/pbench ] || [ -f art/pbench ]; then cp art/pbench pbench; chmod +x pbench; else gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c; fi
+for th in 1 2; do t0=$(date +%s.%N); o=$(./pbench $th 10000000); t1=$(date +%s.%N); echo "L1BARE $o host_wall_s=$(echo "$t1 - $t0" | bc)"; done
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp l2/bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
 printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\necho PB_START 1\n/bin/pbench 1 10000000\necho PB_START $(nproc)\n/bin/pbench $(nproc) 10000000\necho PB_START 1b\n/bin/pbench 1 10000000\necho PB_DONE\npoweroff -f\n' > l3/init; chmod +x l3/init
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
