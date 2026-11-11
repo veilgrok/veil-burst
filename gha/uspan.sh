@@ -16,7 +16,7 @@ p=p or (ks[0],ks[1]); print(p[0],p[1],d[p[0]],d[p[1]])")
 fi
 P=$((1-G)); RUN=$GITHUB_RUN_ID; J() { echo "VEIL_JSON $1"; }; K() { python3 gha/kv.py "$@"; }
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$G,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo),\"region\":\"$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')\"}"
-gcc -O2 -shared -fPIC -o uffd_shim.so gha/uffd_shim.c -ldl -lpthread && gcc -O2 -o memsrv gha/memsrv.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -static -pthread -o pbench gha/pbench.c || { echo "build failed"; exit 1; }
+gcc -O2 -shared -fPIC -o uffd_shim.so gha/uffd_shim.c -ldl -lpthread && gcc -O2 -o memsrv gha/memsrv.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -pthread -o dsm gha/dsm.c && gcc -O2 -static -pthread -o pbench gha/pbench.c || { echo "build failed"; exit 1; }
 # --- WireGuard over hole-punched UDP
 mkdir -p /etc/wireguard; (umask 077; wg genkey > /etc/wireguard/k); PUB=$(wg pubkey < /etc/wireguard/k)
 read MIP MPORT < <(K stun 51820); K put us-$RUN-wg-$G "{\"ip\":\"$MIP\",\"port\":$MPORT,\"pub\":\"$PUB\"}"
@@ -27,7 +27,8 @@ ip addr add 10.88.0.$((G+1))/24 dev wg0; ip link set wg0 mtu 1420 up; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
 if [ $G = 1 ]; then
   ./memsrv 7801 512 2> memsrv.log & SP=$!; sleep 1; K put us-$RUN-ready-1 1
-  K wait us-$RUN-done- 1 2700 >/dev/null; kill $SP; sleep 1; cat memsrv.log | tail -20 | sed 's/^/[memsrv] /'; exit 0
+  K wait us-$RUN-done- 1 2700 >/dev/null; kill $SP; sleep 1; cat memsrv.log | tail -20 | sed 's/^/[memsrv] /';
+  if [ "${DSMT:-1}" = 1 ]; then timeout 300 ./dsm home 7901 ${DSMP:-2049} 2> dsmhome.log & sleep 0.5; timeout 300 ./dsm client 1 127.0.0.1:7901 ${DSMP:-2049} ${DSMR:-2000} | sed 's/^/[dsm] /'; wait; sed 's/^/[dsm] /' dsmhome.log; fi; exit 0
 fi
 # ---- compute node: guest = same 4.18 kernel + busybox initrd as prof Phase A
 cp art/pbench pbench 2>/dev/null; chmod +x pbench; MT=${MTMB:-352}
@@ -58,4 +59,4 @@ for c in ${CFGSU:-U_memfd U_uffd U_rem U_rem_evict U_memfd2 U_uffd2 U_rem2}; do 
  U_rem_b*) runU $c $SH VEIL_UFFD_BATCH=${c#U_rem_b} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=0;;
  U_rem_evict*) runU $c $SH VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=${RES:-128};;
 esac; done
-K put us-$RUN-done-0 1; wg show wg0 | grep transfer
+K put us-$RUN-done-0 1; [ "${DSMT:-1}" = 1 ] && timeout 300 ./dsm client 0 10.88.0.2:7901 ${DSMP:-2049} ${DSMR:-2000} | sed 's/^/[dsm] /'; wg show wg0 | grep transfer
