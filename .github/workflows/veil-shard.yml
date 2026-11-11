@@ -8,6 +8,7 @@ on:
       relay_url: {description: Veil relay URL, required: true, type: string}
       wpr: {description: Veil workers per runner, required: false, default: "8", type: string}
       tag: {required: false, default: "", type: string}
+      calib_after: {description: "1 = calibrate after work (e2e mode)", required: false, default: "0", type: string}
 run-name: "Veil shard ${{ inputs.tag }}"
 permissions:
   contents: read
@@ -25,6 +26,7 @@ jobs:
         env:
           GIDX: ${{ matrix.index }}
           WPR: ${{ inputs.wpr }}
+          CALIB_AFTER: ${{ inputs.calib_after }}
           VEIL_RELAY_URL: ${{ inputs.relay_url }}
           VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
         run: bash gha/shard.sh
