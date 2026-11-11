@@ -1,0 +1,30 @@
+# One sharded Veil job across N runners: dynamic work-stealing via the Veil dispatcher.
+# Dispatch only. Relay token is an Actions secret (never in repo contents). No mining.
+name: Veil shard
+on:
+  workflow_dispatch:
+    inputs:
+      indices: {description: JSON matrix indices, required: true, default: "[0]", type: string}
+      relay_url: {description: Veil relay URL, required: true, type: string}
+      wpr: {description: Veil workers per runner, required: false, default: "8", type: string}
+      tag: {required: false, default: "", type: string}
+run-name: "Veil shard ${{ inputs.tag }}"
+permissions:
+  contents: read
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(inputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        env:
+          GIDX: ${{ matrix.index }}
+          WPR: ${{ inputs.wpr }}
+          VEIL_RELAY_URL: ${{ inputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: bash gha/shard.sh

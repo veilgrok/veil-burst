@@ -35,6 +35,7 @@ def up():
     while not stop:
         with lock:
             lock.wait(timeout=0.5)
+            if buf: lock.wait(timeout=0.015)
             pk = buf[:]; buf.clear()
             if pk or time.time() - last > 0.5:
                 pk += [{"w": n, "d": d} for n, d in hellos.items()]; hellos.clear()
