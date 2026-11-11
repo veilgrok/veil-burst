@@ -37,7 +37,7 @@ chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3x
 stamp() { n=$1; while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB1_START*) a=$now;; *PB2_START*) b=$now; L "PROF $n pb1_wall_s=$(python3 -c "print(round($b-$a,3))")";; *MT_START*) c=$now; L "PROF $n pb2_wall_s=$(python3 -c "print(round($c-$b,3))")";; *XC_START*) d=$now; L "PROF $n mt_wall_s=$(python3 -c "print(round($d-$c,3))")";; *PB_DONE*) L "PROF $n xc_wall_s=$(python3 -c "print(round($now-$d,3))")"; (sleep 3; pkill -9 -f opt/gvm/qemu-system; pkill -9 -f "qemu-system-x86_64 -enable-kvm") & ;; esac
   case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*"Total of"*|*"Command line"*|*rror*|*panic*|*DSM*|*"set kvmclock"*|*"RTT"*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp 2 -m 512 -kernel /w/art/bzImage -initrd /w/l3x.gz -nographic -no-reboot -net none"
-GA="console=ttyS0 panic=-1 no_timer_check noapic"
+GA="console=ttyS0 panic=-1 no_timer_check noapic ${GAX:-no-kvmclock}"
 SHIM="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil"
 watch_mon() { for t in ${WATCHT:-120 300 600 900 1200}; do sleep $((t - ${pt:-0})); pt=$t; for p in "$@"; do python3 - $p <<'PY' 2>/dev/null | tr -d '\r' | grep -aE "CPU #" | sed "s/^/MON t=$t :$p /" | while IFS= read -r x; do L "$x"; done
 import socket,sys,time
@@ -52,7 +52,7 @@ print(d.decode(errors="replace"))
 PY
   done; tail -2 home.log 2>/dev/null | sed "s/^/HOME t=$t /" | while IFS= read -r x; do L "$x"; done; done; }
 run_split_local() { n=$1; shm0=$2; shm1=$3; env0=$4; T0=$(date +%s.%N); rm -f /dev/shm/veil*
-  [ -n "$env0" ] && { VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL ${ST:-600} ./dsm home 7910 131072 2> home.log & }
+  [ -n "$env0" ] && { VEIL_DSM_DUMP=1 VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL ${ST:-600} ./dsm home 7910 131072 2> home.log & }
   sleep 0.5; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=1 $GQ -shm-path $shm1 -append "$GA" -local-cpu 1,start=1,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4445,server,nowait > ap_$n.log 2>&1 &
   sleep 1; (WATCHT="60 180 400" watch_mon 4444 4445 &) ; timeout -s KILL ${ST:-600} chroot /l2r env $env0 VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path $shm0 -append "$GA" -local-cpu 1,start=0,iplist="127.0.0.1 127.0.0.1" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $n
   wait; grep -a "DSM node1" ap_$n.log | tail -1 | sed "s/^/[$n-ap] /"; [ -n "$env0" ] && tail -3 home.log | sed "s/^/[$n-home] /"; pkill -f "dsm home" ; pkill -9 -f opt/gvm/qemu; L "CFG_END $n"; }
@@ -78,7 +78,7 @@ ip addr add 10.88.0.$((G+1))/24 dev wg0; ip link set wg0 mtu 1420 up; sleep 4
 J "{\"kind\":\"wg_ping\",\"gidx\":$G,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((P+1)) | tail -1)\"}"
 rm -f /dev/shm/veil*; T0=$(date +%s.%N); XT=${XT:-1800}
 if [ $G = 0 ]; then
-  VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
+  VEIL_DSM_DUMP=1 VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1 timeout -s KILL $XT ./dsm home 7910 131072 2> home.log & sleep 0.5; K put vs-$RUN-home-0 1
   (WATCHT="120 300 600 900 1200 1500" watch_mon 4444 &)
   timeout -s KILL $XT chroot /l2r env $SHIM VEIL_DSM_HOME=127.0.0.1:7910 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu 1,start=0,iplist="10.88.0.1 10.88.0.2" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp X_wg
   K put vs-$RUN-xdone-0 1; sleep 3; tail -3 home.log | sed 's/^/[X_wg-home] /'; pkill -f "dsm home"; wg show wg0 | grep transfer
