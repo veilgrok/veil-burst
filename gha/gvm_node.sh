@@ -2,21 +2,16 @@
 # One GiantVM node per runner: WireGuard over UDP hole punch (runner<->runner), tap-routed L2 DSM host, QEMU-gvm L3 spanning nodes.
 set -u; GI=$GIDX; W=$GITHUB_WORKSPACE; RUN=$GITHUB_RUN_ID; J() { echo "VEIL_JSON $1"; }; K() { python3 gha/kv.py "$@"; }
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$GI,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo),\"svm\":$(grep -c -w svm /proc/cpuinfo),\"region\":\"$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')\"}"
-V=$(grep -q -w vmx /proc/cpuinfo && echo intel || echo amd); K put gvm-$RUN-cpu-$GI $V
-ALL=$(K wait gvm-$RUN-cpu- $NNODES 240) || ALL='{}'
-INTEL=$(echo "$ALL" | python3 -c "import json,sys;d=json.load(sys.stdin);print(' '.join(sorted([k.rsplit('-',1)[1] for k,v in d.items() if v=='intel'],key=int)))")
-J "{\"kind\":\"intel_pool\",\"gidx\":$GI,\"intel_gidx\":\"$INTEL\",\"nodes_seen\":$(echo "$ALL" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')}"
-set -- $INTEL; MODE=none
-[ "${1:-}" = "$GI" ] && { G=0; MODE=$([ $# -ge 2 ] && echo pair || echo solo); PG=${2:-}; }
-[ "${2:-}" = "$GI" ] && { G=1; MODE=pair; PG=$1; }
-J "{\"kind\":\"role\",\"gidx\":$GI,\"mode\":\"$MODE\"}"; [ $MODE = none ] && exit 0
+# roles: gidx 0/1 = cross-runner pair (WireGuard), gidx 2 = two GiantVM nodes on one runner ("local pair")
+case $GI in 0) G=0; MODE=pair;; 1) G=1; MODE=pair;; *) G=0; MODE=solo;; esac
+J "{\"kind\":\"role\",\"gidx\":$GI,\"mode\":\"$MODE\"}"
 P=$((1-G))
 sudo apt-get -qq update >/dev/null; sudo apt-get -qq install -y wireguard-tools qemu-system-x86 busybox-static cpio >/dev/null 2>&1; sudo chmod 666 /dev/kvm
 # --- WireGuard over hole-punched UDP 51820
 sudo mkdir -p /etc/wireguard; (umask 077; wg genkey | sudo tee /etc/wireguard/k >/dev/null); PUB=$(sudo cat /etc/wireguard/k | wg pubkey)
+if [ $MODE = pair ]; then
 read MIP MPORT < <(python3 gha/kv.py stun 51820)
 K put gvm-$RUN-wg-$G "{\"ip\":\"$MIP\",\"port\":$MPORT,\"pub\":\"$PUB\"}"
-if [ $MODE = pair ]; then
 PEER=$(K wait gvm-$RUN-wg- 2 300) || { echo "peer never arrived"; exit 1; }
 read PIP PPORT PPUB < <(echo "$PEER" | python3 -c "import json,sys;d=json.load(sys.stdin);p=json.loads(d['gvm-$RUN-wg-$P']);print(p['ip'],p['port'],p['pub'])")
 sudo ip link add wg0 type wireguard; sudo wg set wg0 listen-port 51820 private-key /etc/wireguard/k peer $PPUB endpoint $PIP:$PPORT allowed-ips 10.88.0.$((P+1))/32,10.89.0.$((P+1))/32 persistent-keepalive 1
@@ -46,9 +41,9 @@ ip link set lo up; ip link set eth0 up; ip addr add 10.89.0.$((g+1))/32 dev eth0
 echo L2 node=$g nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) \$(grep MemTotal /proc/meminfo)
 /opt/gvm/pbench 1 10000000 | sed "s/^/L2BARE /"; /opt/gvm/pbench \$(nproc) 10000000 | sed 's/^/L2BARE /'
 sleep 3; cd /opt/gvm
-echo GVM_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu host -smp $((2*lc)) -m 2048 -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
+echo GVM_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m 2048 -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
 echo GVM_END \$(date +%s)
-if [ $g = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu host -smp $bc -m 2048 -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+if [ $g = 0 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m 2048 -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
 dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
 /bb/poweroff -f
 EOS

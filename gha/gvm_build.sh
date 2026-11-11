@@ -2,6 +2,8 @@
 # Build DSM kernel + QEMU-gvm (TCP router) + an ubuntu:18.04 L2 userland tarball holding QEMU-gvm and its libs.
 set -u; W=$GITHUB_WORKSPACE; git clone -q --depth 1 https://github.com/ememos/GiantVM $W/gvm
 sed -i 's|^#define ROUTER_CONNECTION_RDMA|//#define ROUTER_CONNECTION_RDMA|; s|^//#define ROUTER_CONNECTION_TCP|#define ROUTER_CONNECTION_TCP|' $W/gvm/QEMU-gvm-vcpupin/interrupt-router.c
+# ABI fix: QEMU-gvm's bundled header says KVM_CAP_X86_DSM=133, Linux-DSM-4.18 advertises 156 -> QEMU reported dsm_extension: 0
+sed -i 's/#define KVM_CAP_X86_DSM 133/#define KVM_CAP_X86_DSM 156/' $W/gvm/QEMU-gvm-vcpupin/linux-headers/linux/kvm.h; grep -n KVM_CAP_X86_DSM $W/gvm/QEMU-gvm-vcpupin/linux-headers/linux/kvm.h
 docker run --rm -v $W/gvm:/g -w /g/QEMU-gvm-vcpupin ubuntu:18.04 bash -c '
   export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null; apt-get -qq install -y build-essential python pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev libnuma-dev >/dev/null 2>&1
   ./configure --target-list=x86_64-softmmu --disable-werror --enable-kvm > /g/qconf.log 2>&1 && make -s -j$(nproc) > /g/qbuild.log 2>&1; echo qemu_rc=$?' &
