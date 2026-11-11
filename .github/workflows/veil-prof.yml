@@ -1,0 +1,23 @@
+name: veil-prof
+on:
+  workflow_dispatch:
+    inputs:
+      art_run: {required: true, type: string}
+      n: {required: false, default: "[0,1,2,3,4,5]", type: string}
+      cfgs: {required: false, default: "G_off S_on S_off G_on G_on_na G_off_mlock S_on_host", type: string}
+      intel_only: {required: false, default: "1", type: string}
+permissions: {contents: read, actions: read}
+jobs:
+  prof:
+    strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {name: gvm, path: art, run-id: "${{ inputs.art_run }}", github-token: "${{ github.token }}"}
+      - name: profile
+        env: {GIDX: "${{ matrix.gidx }}", CFGS: "${{ inputs.cfgs }}", INTEL_ONLY: "${{ inputs.intel_only }}"}
+        run: |
+          if [ "$INTEL_ONLY" = 1 ] && ! grep -qw vmx /proc/cpuinfo; then echo "VEIL_JSON {\"kind\":\"skip_amd\",\"cpu\":\"$(lscpu | sed -n 's/Model name: *//p' | head -1)\"}"; exit 0; fi
+          bash gha/gvm_prof.sh
