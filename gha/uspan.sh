@@ -34,13 +34,14 @@ chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.
 for i in 1 2; do t0=$(date +%s.%N); o=$(./pbench 1 10000000); t1=$(date +%s.%N); echo "PROF U_bare pb_wall_s=$(python3 -c "print(round($t1-$t0,3))") $o"; done
 t0=$(date +%s.%N); o=$(./memtouch $MT 3); t1=$(date +%s.%N); echo "PROF U_bare mt_wall_s=$(python3 -c "print(round($t1-$t0,3))") $o"
 Q="qemu-system-x86_64 -enable-kvm -smp 1 -m 512 -cpu kvm64 -kernel art/bzImage -initrd l3.gz -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram"
-runU() { n=$1; shift; echo "CFG_START $n"; timeout 900 env "$@" $Q -append "console=ttyS0 panic=-1" 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now;; *PBENCH*) echo "PROF $n pb_wall_s=$(python3 -c "print(round($now-$t0,3))")";; *MT_START*) t2=$now;; *MEMTOUCH*) echo "PROF $n mt_wall_s=$(python3 -c "print(round($now-$t2,3))")";; esac; case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*UFFD*|qemu-system*|*rror*|*panic*|*"Out of memory"*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
+runU() { n=$1; shift; echo "CFG_START $n"; timeout 900 env "$@" $Q -append "console=ttyS0 panic=-1" 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now;; *PBENCH*) echo "PROF $n pb_wall_s=$(python3 -c "print(round($now-$t0,3))")";; *MT_START*) t2=$now;; *MEMTOUCH*) echo "PROF $n mt_wall_s=$(python3 -c "print(round($now-$t2,3))") sum_ok=$(echo "$l" | grep -q "sum=$((MT*512))" && echo 1 || echo 0)";; esac; case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*UFFD*|qemu-system*|*rror*|*panic*|*"Out of memory"*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
 SH="LD_PRELOAD=$PWD/uffd_shim.so VEIL_UFFD_MATCH=memfd:"
 K wait us-$RUN-ready- 1 300 >/dev/null || echo "memsrv never ready"
 for c in ${CFGSU:-U_memfd U_uffd U_rem U_rem_evict U_memfd2 U_uffd2 U_rem2}; do case $c in
  U_memfd|U_memfd2) runU $c X=1;;
  U_uffd|U_uffd2) runU $c $SH;;
  U_rem|U_rem2) runU $c $SH VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=0;;
+ U_pipe_*|U_pev_*) IFS=_ read -r _ kind b r e <<< "$c"; RESMB=0; [ $kind = pev ] && RESMB=${e#e}; runU $c $SH VEIL_UFFD_PIPE=1 VEIL_UFFD_BATCH=${b#b} VEIL_UFFD_RA=${r#ra} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=$RESMB;;
  U_rem_b*) runU $c $SH VEIL_UFFD_BATCH=${c#U_rem_b} VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=0;;
  U_rem_evict*) runU $c $SH VEIL_UFFD_REMOTE=10.88.0.2:7801 VEIL_UFFD_SPLIT_MB=${SPLIT:-128} VEIL_UFFD_RESIDENT_MB=${RES:-128};;
 esac; done
