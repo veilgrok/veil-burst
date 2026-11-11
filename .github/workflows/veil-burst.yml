@@ -1,0 +1,72 @@
+# Veil GitHub Actions burst: matrix fan-out on standard GitHub-hosted runners.
+# Dispatch only. CPU benchmark + prime-count batch + Veil dispatcher workers.
+# Short jobs, bounded by timeout-minutes. No mining. No secrets in logs.
+name: Veil burst
+
+on:
+  workflow_dispatch:
+    inputs:
+      indices:
+        description: JSON list of matrix indices (local to this repo)
+        required: true
+        default: "[0,1,2,3,4]"
+        type: string
+      offset:
+        description: Global index offset for this repo
+        required: false
+        default: "0"
+        type: string
+      total:
+        description: Total runners across all repos (batch partition size)
+        required: false
+        default: "5"
+        type: string
+      phases:
+        description: Comma list of cpu,batch,veil
+        required: false
+        default: "cpu,batch"
+        type: string
+      hold:
+        description: Seconds to hold after phases (overlap measurement)
+        required: false
+        default: "0"
+        type: string
+      relay_url:
+        description: Veil relay base URL (https)
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: Run label
+        required: false
+        default: ""
+        type: string
+
+run-name: "Veil burst ${{ inputs.tag }}"
+
+permissions:
+  contents: read
+
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(inputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run
+        shell: bash
+        env:
+          GIDX: ${{ matrix.index }}
+          OFFSET: ${{ inputs.offset }}
+          TOTAL: ${{ inputs.total }}
+          PHASES: ${{ inputs.phases }}
+          HOLD: ${{ inputs.hold }}
+          VEIL_RELAY_URL: ${{ inputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: |
+          export GIDX=$((GIDX + OFFSET))
+          bash gha/run.sh
