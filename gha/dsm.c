@@ -34,8 +34,8 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
    (lock/flag pages that are written back unchanged must NOT be replicated: their atomicity needs a single writer) */
 static int looks_pt(const char *pgp, size_t np) { const uint64_t *e = (const uint64_t *)pgp; int n = 0;
   for (int i = 0; i < PS / 8; i++) { uint64_t v = e[i]; if (!v) continue; uint64_t fr = v & 0x000ffffffffff000ull;
-    if (!(v & 1) || !(v & 0x20) || (v & 0x7ff0000000000000ull) || !fr || fr >= np * PS) return 0; n++; }
-  return n > 0; }
+    if (!(v & 1) || (v & 0x7ff0000000000000ull) || !fr || (fr >= np * PS && fr >= (1ull << 32))) return 0; n += !!(v & 0x20); }  /* frames may be MMIO below 4G (fixmap: APIC/HPET) */
+  return n >= 1; }
 struct q { int c; struct msg m; };
 static int home(int port, size_t np) {
   char *mem = calloc(np, PS); uint8_t *wrt = calloc(np, 1); uint32_t *hot = calloc(np, 4); int *owner = malloc(np * sizeof(int)); uint8_t *sh = calloc(np, 1); for (size_t i = 0; i < np; i++) owner[i] = -1; if (getenv("VEIL_DSM_PREFILL") && atoi(getenv("VEIL_DSM_PREFILL"))) memset(sh, 3, np);  /* both clients start with a zero S copy of every page */
@@ -57,7 +57,7 @@ static int home(int port, size_t np) {
     if (cur.m.t == DIFF) { xfer(cs[cur.c], tmp, PS + BM, 0); if (cur.m.pg < np) DODIFF(cur.c, cur.m.pg); continue; }
     int c = cur.c, o = 1 - c; uint64_t pg = cur.m.pg; nreq++;
     if (now() - tl > 10) { tl = now(); fprintf(stderr, "DSM home requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu deferred=%lu wb_changed=%lu wb_same=%lu hot_changed=%lu last_hot_chg=%zx+%d replicated=%lu diffs=%lu diff_words=%lu data_MiB=%.1f\n", nreq, nrecall, ninv, nzero, ndeferred, nchg, nsame, nchg_hot, lastchg_pg, lastchg_off, nrep, ndiff, ndiffw, bytes / 1048576.0);
-      fprintf(stderr, "DSM hot:"); for (int k = 0; k < 8; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u", bi, hot[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
+      fprintf(stderr, "DSM hot:"); for (int k = 0; k < 8; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u%s%s/s%u", bi, hot[bi], rep[bi] ? "R" : "", looks_pt(mem + bi * PS, np) ? "P" : "", same[bi]); if (k < 3 && getenv("VEIL_DSM_DUMP")) { const uint64_t *e = (const uint64_t *)(mem + bi * PS); int m = 0, nz = 0; for (int w = 0; w < PS / 8; w++) if (e[w]) nz++; fprintf(stderr, "[nz=%d", nz); for (int w = 0; w < PS / 8 && m < 6; w++) if (e[w]) { fprintf(stderr, " %x=%llx", w * 8, (unsigned long long)e[w]); m++; } fprintf(stderr, "]"); } hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
     if (pg >= np) { fprintf(stderr, "bad page\n"); continue; }
     if (lease > 0 && owner[pg] == o && hot[pg] >= hotmin && tn - gt[pg] < lease && ndef < 4096) { def[ndef] = cur; due[ndef++] = gt[pg] + lease; ndeferred++; nreq--; continue; }  /* hot page: let the owner keep it for one lease */
     if (rep[pg]) { struct msg r = {.t = DATA_REP, .has_data = 1, .pg = pg}; xfer(cs[c], &r, sizeof r, 1); xfer(cs[c], mem + pg * PS, PS, 1); continue; }
