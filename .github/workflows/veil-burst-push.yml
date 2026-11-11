@@ -5,6 +5,8 @@ name: Veil burst (push)
 on:
   push:
     branches: ["burst-*"]
+  repository_dispatch:
+    types: [veil-burst]
 
 permissions:
   contents: read
