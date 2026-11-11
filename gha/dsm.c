@@ -31,21 +31,25 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 /* ---------------- home ---------------- */
 struct q { int c; struct msg m; };
 static int home(int port, size_t np) {
-  char *mem = calloc(np, PS); uint8_t *wrt = calloc(np, 1); uint32_t *hot = calloc(np, 4); int *owner = malloc(np * sizeof(int)); uint8_t *sh = calloc(np, 1); for (size_t i = 0; i < np; i++) owner[i] = -1;
+  char *mem = calloc(np, PS); uint8_t *wrt = calloc(np, 1); uint32_t *hot = calloc(np, 4); int *owner = malloc(np * sizeof(int)); uint8_t *sh = calloc(np, 1); for (size_t i = 0; i < np; i++) owner[i] = -1; if (getenv("VEIL_DSM_PREFILL") && atoi(getenv("VEIL_DSM_PREFILL"))) memset(sh, 3, np);  /* both clients start with a zero S copy of every page */
   int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 4)) { perror("bind"); return 1; } fprintf(stderr, "DSM home listening %d pages=%zu\n", port, np);
   int cs[2]; for (int i = 0; i < 2; i++) { int s = accept(ls, 0, 0); setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); uint16_t id; xfer(s, &id, 2, 0); cs[id & 1] = s; fprintf(stderr, "DSM home client %d connected\n", id); }
-  struct q pend[4096]; int npend = 0; unsigned long nreq = 0, nrecall = 0, ninv = 0, bytes = 0, nzero = 0; double tl = now(); char tmp[PS];
+  struct q pend[4096]; int npend = 0; struct q def[4096]; double due[4096]; int ndef = 0; double *gt = calloc(np, sizeof(double)); double lease = getenv("VEIL_DSM_LEASE_US") ? atof(getenv("VEIL_DSM_LEASE_US")) / 1e6 : 0; unsigned long ndeferred = 0, nchg = 0, nsame = 0, nchg_hot = 0; size_t lastchg_pg = 0; int lastchg_off = -1; uint32_t hotmin = getenv("VEIL_DSM_HOTMIN") ? atoi(getenv("VEIL_DSM_HOTMIN")) : 50; unsigned long nreq = 0, nrecall = 0, ninv = 0, bytes = 0, nzero = 0; double tl = now(); char tmp[PS];
   /* wait for the ACK for page pg from client c; queue other requests */
-  #define WAITACK(cc, pg) for (;;) { struct msg r; if (xfer(cs[cc], &r, sizeof r, 0)) return 1; if (r.t == ACK && r.pg == (pg)) { if (r.has_data) { xfer(cs[cc], mem + (pg) * PS, PS, 0); wrt[pg] = 1; bytes += PS; } break; } if (r.has_data) xfer(cs[cc], tmp, PS, 0); pend[npend].c = cc; pend[npend++].m = r; }
+  #define WAITACK(cc, pg) for (;;) { struct msg r; if (xfer(cs[cc], &r, sizeof r, 0)) return 1; if (r.t == ACK && r.pg == (pg)) { if (r.has_data) { xfer(cs[cc], tmp, PS, 0); if (memcmp(tmp, mem + (pg) * PS, PS)) { nchg++; if (hot[pg] > 20) { int fo = 0; while (fo < PS && tmp[fo] == mem[(pg) * PS + fo]) fo++; lastchg_pg = pg; lastchg_off = fo; nchg_hot++; } } else nsame++; memcpy(mem + (pg) * PS, tmp, PS); wrt[pg] = 1; bytes += PS; } break; } if (r.has_data) xfer(cs[cc], tmp, PS, 0); pend[npend].c = cc; pend[npend++].m = r; }
   int done = 0;
   while (done < 2) {
-    struct q cur; if (npend) { cur = pend[0]; memmove(pend, pend + 1, --npend * sizeof *pend); }
-    else { struct pollfd p[2] = {{cs[0], POLLIN, 0}, {cs[1], POLLIN, 0}}; poll(p, 2, -1); int c = (p[0].revents & (POLLIN | POLLHUP)) ? 0 : 1; cur.c = c; if (xfer(cs[c], &cur.m, sizeof cur.m, 0)) { done++; close(cs[c]); cs[c] = -1; if (done < 2) { /* other may still run */ } if (done == 2) break; continue; } }
+    struct q cur; int di = -1; double tn = now(), mdue = 1e18; for (int i = 0; i < ndef; i++) { if (due[i] <= tn) { di = i; break; } if (due[i] < mdue) mdue = due[i]; }
+    if (di >= 0) { cur = def[di]; def[di] = def[ndef - 1]; due[di] = due[ndef - 1]; ndef--; }
+    else if (npend) { cur = pend[0]; memmove(pend, pend + 1, --npend * sizeof *pend); }
+    else { struct pollfd p[2] = {{cs[0], POLLIN, 0}, {cs[1], POLLIN, 0}}; struct timespec to = {0, 0}; double w = ndef ? mdue - tn : 0; if (w < 0) w = 0; to.tv_sec = (time_t)w; to.tv_nsec = (long)((w - (time_t)w) * 1e9);
+      if (ppoll(p, 2, ndef ? &to : NULL, NULL) == 0) continue; int c = (p[0].revents & (POLLIN | POLLHUP)) ? 0 : 1; cur.c = c; if (xfer(cs[c], &cur.m, sizeof cur.m, 0)) { done++; close(cs[c]); cs[c] = -1; if (done < 2) { /* other may still run */ } if (done == 2) break; continue; } }
     int c = cur.c, o = 1 - c; uint64_t pg = cur.m.pg; nreq++;
-    if (now() - tl > 10) { tl = now(); fprintf(stderr, "DSM home requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu data_MiB=%.1f\n", nreq, nrecall, ninv, nzero, bytes / 1048576.0);
+    if (now() - tl > 10) { tl = now(); fprintf(stderr, "DSM home requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu deferred=%lu wb_changed=%lu wb_same=%lu hot_changed=%lu last_hot_chg=%zx+%d data_MiB=%.1f\n", nreq, nrecall, ninv, nzero, ndeferred, nchg, nsame, nchg_hot, lastchg_pg, lastchg_off, bytes / 1048576.0);
       fprintf(stderr, "DSM hot:"); for (int k = 0; k < 8; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u", bi, hot[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
     if (pg >= np) { fprintf(stderr, "bad page\n"); continue; }
+    if (lease > 0 && owner[pg] == o && hot[pg] >= hotmin && tn - gt[pg] < lease && ndef < 4096) { def[ndef] = cur; due[ndef++] = gt[pg] + lease; ndeferred++; nreq--; continue; }  /* hot page: let the owner keep it for one lease */
     if (cur.m.t == RD) {
       if (owner[pg] == o) { struct msg r = {.t = RECALL, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); nrecall++; hot[pg]++; WAITACK(o, pg); owner[pg] = -1; sh[pg] |= 1 << o; }
       struct msg r = {.t = DATA_S, .has_data = wrt[pg], .pg = pg}; xfer(cs[c], &r, sizeof r, 1); if (wrt[pg]) { xfer(cs[c], mem + pg * PS, PS, 1); bytes += PS; } else nzero++; sh[pg] |= 1 << c;
@@ -54,7 +58,7 @@ static int home(int port, size_t np) {
       if (owner[pg] == o || (sh[pg] >> o & 1)) { struct msg r = {.t = INV, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); ninv++; hot[pg]++; WAITACK(o, pg); sh[pg] &= ~(1 << o); }
       if (sh[pg] >> c & 1) { struct msg r = {.t = GRANT_M, .pg = pg}; xfer(cs[c], &r, sizeof r, 1); }
       else { struct msg r = {.t = DATA_M, .has_data = wrt[pg], .pg = pg}; xfer(cs[c], &r, sizeof r, 1); if (wrt[pg]) { xfer(cs[c], mem + pg * PS, PS, 1); bytes += PS; } else nzero++; }
-      owner[pg] = c; sh[pg] = 0;
+      owner[pg] = c; sh[pg] = 0; gt[pg] = now();
     }
   }
   fprintf(stderr, "DSM home done requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu data_MiB=%.1f\n", nreq, nrecall, ninv, nzero, bytes / 1048576.0); return 0;

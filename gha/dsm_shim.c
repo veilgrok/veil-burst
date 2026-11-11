@@ -84,6 +84,10 @@ static void attach(void *p, size_t len, int fd, const char *tgt) {
   uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK); struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM};
   struct uffdio_register reg = {.range = {(uintptr_t)p, len}, .mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP};
   if (uffd < 0 || ioctl(uffd, UFFDIO_API, &api) || ioctl(uffd, UFFDIO_REGISTER, &reg)) { perror("DSM uffd"); exit(1); }
+  if (getenv("VEIL_DSM_PREFILL") && atoi(getenv("VEIL_DSM_PREFILL"))) {  /* every page starts as a local zero S copy (home marks both nodes sharers): no startup fetch storm */
+    size_t ch = 2u << 20; char *z = aligned_alloc(PS, ch); memset(z, 0, ch); double t0 = now();
+    for (size_t o = 0; o < len; o += ch) { struct uffdio_copy c = {.dst = (uintptr_t)p + o, .src = (uintptr_t)z, .len = len - o < ch ? len - o : ch, .mode = UFFDIO_COPY_MODE_WP}; if (ioctl(uffd, UFFDIO_COPY, &c)) { perror("DSM prefill"); break; } }
+    fprintf(stderr, "DSM node%d prefilled %zu MiB as shared-zero in %.3fs\n", myid, len >> 20, now() - t0); free(z); }
   pthread_t t1, t2; pthread_create(&t1, 0, receiver, 0); pthread_create(&t2, 0, faulter, 0);
   fprintf(stderr, "DSM node%d attached %s len=%zu MiB pages=%zu home=%s\n", myid, tgt, len >> 20, np, hp);
 }
