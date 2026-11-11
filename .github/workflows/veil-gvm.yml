@@ -7,6 +7,7 @@ on:
       n: {required: false, default: "[0,1,2,3,4,5,6,7]", type: string}
       nnodes: {required: false, default: "8", type: string}
       l3args: {required: false, default: "", type: string}
+      solo: {required: false, default: "0", type: string}
 permissions: {contents: read, actions: read}
 jobs:
   build:
@@ -23,7 +24,7 @@ jobs:
     if: always()
     strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
     runs-on: ubuntu-latest
-    timeout-minutes: 28
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -35,6 +36,9 @@ jobs:
           GIDX: ${{ matrix.gidx }}
           NNODES: ${{ inputs.nnodes }}
           L3ARGS: ${{ inputs.l3args }}
+          SOLO: ${{ inputs.solo }}
+          L2T: ${{ inputs.solo == '1' && '2300' || '1000' }}
+          WATCHT: ${{ inputs.solo == '1' && '45 150 300 450 600 750 900 1050 1200 1350 1500 1650 1800' || '45 150 300 450 600 750' }}
           VEIL_RELAY_URL: ${{ inputs.relay_url }}
           VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
         run: bash gha/gvm_node.sh
