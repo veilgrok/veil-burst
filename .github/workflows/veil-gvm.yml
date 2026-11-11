@@ -1,0 +1,32 @@
+name: veil-gvm
+on:
+  workflow_dispatch:
+    inputs:
+      relay_url: {required: true, type: string}
+permissions: {contents: read}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash gha/gvm_build.sh
+      - uses: actions/upload-artifact@v4
+        with: {name: gvm, path: out/, retention-days: 1}
+  node:
+    needs: build
+    strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {name: gvm, path: art}
+      - name: bare-metal baseline
+        run: gcc -O2 -pthread -o pb gha/pbench.c && ./pb 1 3000000 && ./pb $(nproc) 3000000
+      - name: gvm node
+        env:
+          GIDX: ${{ matrix.gidx }}
+          VEIL_RELAY_URL: ${{ inputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: bash gha/gvm_node.sh

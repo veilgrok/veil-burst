@@ -1,0 +1,17 @@
+#!/bin/bash
+# Build DSM kernel + QEMU-gvm (TCP router) + an ubuntu:18.04 L2 userland tarball holding QEMU-gvm and its libs.
+set -u; W=$GITHUB_WORKSPACE; git clone -q --depth 1 https://github.com/ememos/GiantVM $W/gvm
+sed -i 's|^#define ROUTER_CONNECTION_RDMA|//#define ROUTER_CONNECTION_RDMA|; s|^//#define ROUTER_CONNECTION_TCP|#define ROUTER_CONNECTION_TCP|' $W/gvm/QEMU-gvm-vcpupin/interrupt-router.c
+docker run --rm -v $W/gvm:/g -w /g/QEMU-gvm-vcpupin ubuntu:18.04 bash -c '
+  export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null; apt-get -qq install -y build-essential python pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev libnuma-dev >/dev/null 2>&1
+  ./configure --target-list=x86_64-softmmu --disable-werror --enable-kvm > /g/qconf.log 2>&1 && make -s -j$(nproc) > /g/qbuild.log 2>&1; echo qemu_rc=$?' &
+docker run --rm -v $W/gvm:/g -w /g/Linux-DSM-4.18 ubuntu:18.04 bash -c '
+  export DEBIAN_FRONTEND=noninteractive; apt-get -qq update >/dev/null; apt-get -qq install -y build-essential flex bison libelf-dev libssl-dev bc kmod >/dev/null
+  make -s defconfig; ./scripts/config -e KVM -e KVM_AMD -e KVM_INTEL -e VIRTIO_PCI -e VIRTIO_NET -e VIRTIO_BLK -e BLK_DEV_INITRD -e DEVTMPFS -e DEVTMPFS_MOUNT -e KVM_DSM -e KTCP_NETWORK -d KRDMA_NETWORK -e INFINIBAND -e INFINIBAND_ADDR_TRANS -e TUN -e E1000; make -s olddefconfig
+  make -s -j$(nproc) bzImage > /g/kbuild.log 2>&1; echo kernel_rc=$?'
+wait
+mkdir -p out; cp $W/gvm/Linux-DSM-4.18/arch/x86/boot/bzImage out/
+Q=$W/gvm/QEMU-gvm-vcpupin; mkdir -p ctx/opt/gvm; cp $Q/x86_64-softmmu/qemu-system-x86_64 ctx/opt/gvm/; cp $Q/pc-bios/{bios-256k.bin,kvmvapic.bin,linuxboot_dma.bin,linuxboot.bin,vgabios-stdvga.bin,efi-e1000.rom,efi-virtio.rom,multiboot.bin} ctx/opt/gvm/ 2>/dev/null
+printf 'FROM ubuntu:18.04\nRUN apt-get -qq update && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y libglib2.0-0 libpixman-1-0 libfdt1 libnuma1 iproute2 busybox-static >/dev/null && rm -rf /var/lib/apt/lists/*\nCOPY opt /opt\n' > ctx/Dockerfile
+docker build -q -t l2root ctx && cid=$(docker create l2root) && docker export $cid | gzip -1 > out/l2root.tar.gz
+ls -la out; echo "VEIL_JSON {\"kind\":\"gvm_build\",\"bz\":$([ -f out/bzImage ] && echo 1 || echo 0),\"qemu\":$([ -x ctx/opt/gvm/qemu-system-x86_64 ] && echo 1 || echo 0)}"
