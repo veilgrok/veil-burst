@@ -3,9 +3,11 @@ on:
   workflow_dispatch:
     inputs:
       relay_url: {required: true, type: string}
-permissions: {contents: read}
+      art_run: {required: false, default: "", type: string}
+permissions: {contents: read, actions: read}
 jobs:
   build:
+    if: inputs.art_run == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -15,15 +17,16 @@ jobs:
         with: {name: gvm, path: out/, retention-days: 1}
   node:
     needs: build
+    if: always()
     strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: {name: gvm, path: art}
+        with: {name: gvm, path: art, run-id: "${{ inputs.art_run || github.run_id }}", github-token: "${{ github.token }}"}
       - name: bare-metal baseline
-        run: gcc -O2 -pthread -o pb gha/pbench.c && ./pb 1 3000000 && ./pb $(nproc) 3000000
+        run: gcc -O2 -pthread -o pb gha/pbench.c && ./pb 1 10000000 && ./pb $(nproc) 10000000
       - name: gvm node
         env:
           GIDX: ${{ matrix.gidx }}
