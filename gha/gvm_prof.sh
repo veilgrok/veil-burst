@@ -3,13 +3,13 @@
 # Per config: host-wall pbench 1t (L2 /proc/uptime), L2 KVM debugfs exit counters over exactly the pbench window, L3 clocksource + timer IRQ delta.
 set -u; J() { echo "VEIL_JSON $1"; }
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$GIDX,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo)}"
-sudo apt-get -qq update >/dev/null; sudo apt-get -qq install -y qemu-system-x86 busybox-static cpio >/dev/null 2>&1; sudo chmod 666 /dev/kvm
+echo STEP apt; timeout 240 sudo apt-get -qq -o Acquire::Retries=3 update >/dev/null 2>&1; timeout 400 sudo apt-get -qq -o Acquire::Retries=3 install -y qemu-system-x86 busybox-static cpio >/dev/null 2>&1; echo "STEP apt rc=$? qemu=$(qemu-system-x86_64 --version | head -1)"; sudo chmod 666 /dev/kvm
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
 cp art/pbench pbench 2>/dev/null || gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c; chmod +x pbench
 for th in 1; do t0=$(date +%s.%N); o=$(./pbench $th 10000000); t1=$(date +%s.%N); echo "L1BARE $o host_wall_s=$(python3 -c "print(round($t1-$t0,3))")"; done
 # stock QEMU inside the L2 rootfs (Ubuntu 18.04 qemu 2.11) for the stock-vs-gvm A/B
 sudo cp /etc/resolv.conf l2/etc/resolv.conf; sudo mount -t proc p l2/proc
-sudo chroot l2 bash -c 'apt-get -qq update >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends qemu-system-x86 >/dev/null 2>&1; ls -la /usr/bin/qemu-system-x86_64 && /usr/bin/qemu-system-x86_64 --version | head -1' | sed 's/^/STOCKQEMU /'
+timeout 400 sudo chroot l2 bash -c 'apt-get -qq update >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends qemu-system-x86 >/dev/null 2>&1; ls -la /usr/bin/qemu-system-x86_64 && /usr/bin/qemu-system-x86_64 --version | head -1' | sed 's/^/STOCKQEMU /'
 sudo umount l2/proc
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp l2/bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
 cat > l3/init <<'EOF'
@@ -25,6 +25,19 @@ poweroff -f
 EOF
 chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
+# ---- Phase A: TWO levels. Stock QEMU on the L1 runner runs the same L3 kernel+initrd directly (it becomes an L2 guest).
+ksnap() { sudo sh -c 'for f in /sys/kernel/debug/kvm/*; do [ -f "$f" ] && echo "${f##*/} $(cat $f)"; done' 2>/dev/null; }
+runA() { n=$1; shift; echo "CFG_START $n"; timeout 300 "$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now; ksnap > /tmp/a0;; *PBENCH*) ksnap > /tmp/a1; echo "PROF $n wall_s=$(python3 -c "print(round($now-$t0,3))") $(awk 'NR==FNR{a[$1]=$2;next}{d=$2-a[$1]; if(d>0) printf "%s=%d ",$1,d}' /tmp/a0 /tmp/a1)";; esac; case "$l" in *L3*|*IRQ*|*PBENCH*|*clocksource*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
+sudo cp /boot/vmlinuz-$(uname -r) k6; sudo chmod 644 k6
+A="qemu-system-x86_64 -enable-kvm -smp 1 -m 512 -initrd l3.gz"
+NA="console=ttyS0 panic=-1 noapic no_timer_check"; DF="console=ttyS0 panic=-1"
+for c in ${CFGSA:-A_on A_off_na A_host A_k6_on A_on_invtsc}; do case $c in
+ A_on) runA A_on $A -kernel art/bzImage -cpu kvm64 -append "$DF";;
+ A_off_na) runA A_off_na $A -kernel art/bzImage -cpu kvm64 -machine pc,kernel-irqchip=off -append "$NA";;
+ A_host) runA A_host $A -kernel art/bzImage -cpu host -append "$DF";;
+ A_k6_on) runA A_k6_on $A -kernel k6 -cpu host -append "$DF";;
+ A_on_invtsc) runA A_on_invtsc $A -kernel art/bzImage -cpu kvm64,+invtsc -append "$DF";;
+esac; done
 CFGS=${CFGS:-"G_off S_on S_off G_on G_on_na G_off_mlock S_on_host"}
 cat > init <<EOS
 #!/bin/busybox sh
