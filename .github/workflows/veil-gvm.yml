@@ -4,6 +4,8 @@ on:
     inputs:
       relay_url: {required: true, type: string}
       art_run: {required: false, default: "", type: string}
+      n: {required: false, default: "[0,1,2,3,4,5,6,7]", type: string}
+      nnodes: {required: false, default: "8", type: string}
 permissions: {contents: read, actions: read}
 jobs:
   build:
@@ -18,9 +20,9 @@ jobs:
   node:
     needs: build
     if: always()
-    strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
+    strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -30,6 +32,7 @@ jobs:
       - name: gvm node
         env:
           GIDX: ${{ matrix.gidx }}
+          NNODES: ${{ inputs.nnodes }}
           VEIL_RELAY_URL: ${{ inputs.relay_url }}
           VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
         run: bash gha/gvm_node.sh
