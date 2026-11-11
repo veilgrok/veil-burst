@@ -25,7 +25,7 @@ mktap() { sudo ip tuntap add tap$1 mode tap user $(id -un); sudo ip addr add 10.
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
 if [ -x art/pbench ] || [ -f art/pbench ]; then cp art/pbench pbench; chmod +x pbench; else gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c; fi
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp l2/bin/busybox pbench l3/bin/; for c in sh cat grep nproc poweroff mount head; do ln -sf busybox l3/bin/$c; done
-printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\n/bin/pbench 1 10000000\n/bin/pbench $(nproc) 10000000\npoweroff -f\n' > l3/init; chmod +x l3/init
+printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1\necho L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo)\necho PB_START 1\n/bin/pbench 1 10000000\necho PB_START $(nproc)\n/bin/pbench $(nproc) 10000000\necho PB_START 1b\n/bin/pbench 1 10000000\necho PB_DONE\npoweroff -f\n' > l3/init; chmod +x l3/init
 (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.gz)
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
 NODES="10.89.0.1 10.89.0.2"
@@ -48,11 +48,11 @@ dbg() { echo "WATCH t=\$1"; printf 'info status\ninfo cpus\ninfo registers\n' | 
   echo "DSMDBG lines=\$(dmesg | grep -ac -iE 'dsm|ivy')"; dmesg | grep -aiE 'dsm|ivy|ktcp' | head -40 | sed 's/^/DSMDBG /'; dmesg | grep -aiE 'dsm|ivy|ktcp' | tail -15 | sed 's/^/DSMTAIL /'; }
 echo 1 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; echo DSMVERBOSE=\$(cat /sys/module/kvm/parameters/dsm_verbose 2>&1)
 echo GVM_START \$(date +%s)
-( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -machine pc,kernel-irqchip=off -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8 $L3ARGS" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
+( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -machine pc,kernel-irqchip=off -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8 $L3ARGS" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | while IFS= read -r l; do read up x </proc/uptime; echo "L3OUT @\$up \$l"; done ) &
 for t in ${WATCHT:-45 150 300 450 600 750}; do sleep \$((t - \${last:-0})); last=\$t; pidof qemu-system-x86_64 >/dev/null || break; dbg \$t; echo 0 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; grep -aE "^(L3 |PBENCH)" /tmp/l3.out 2>/dev/null; done
 pidof qemu-system-x86_64 >/dev/null && { echo GVM_KILL; killall qemu-system-x86_64; sleep 2; }
 echo GVM_END \$(date +%s)
-if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1 $L3ARGS" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1 $L3ARGS" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do read up x </proc/uptime; echo "B1OUT @\$up \$l"; done; echo BASE1_MID \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 2 -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu 2,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1 $L3ARGS" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do read up x </proc/uptime; echo "B2OUT @\$up \$l"; done; echo BASE1_END \$(date +%s); fi
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
