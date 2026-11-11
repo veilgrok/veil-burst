@@ -30,7 +30,7 @@ printf '#!/bin/sh\nmount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmp
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
 NODES="10.89.0.1 10.89.0.2"
 # mk_l2 NODE LOCALCPUS BASECPUS -> l2_NODE.gz   (L3: 512 MiB, mlock'd, earlyprintk serial; watchdog dumps monitor regs, vCPU kernel stacks, DSM debug)
-L3MEM=${L3MEM:-512}
+L3MEM=${L3MEM:-512}; L3ARGS=${L3ARGS:-}
 mk_l2() { local g=$1 lc=$2 bc=$3
 cat > init <<EOS
 #!/bin/busybox sh
@@ -48,11 +48,11 @@ dbg() { echo "WATCH t=\$1"; printf 'info status\ninfo cpus\ninfo registers\n' | 
   echo "DSMDBG lines=\$(dmesg | grep -ac -iE 'dsm|ivy')"; dmesg | grep -aiE 'dsm|ivy|ktcp' | head -40 | sed 's/^/DSMDBG /'; dmesg | grep -aiE 'dsm|ivy|ktcp' | tail -15 | sed 's/^/DSMTAIL /'; }
 echo 1 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; echo DSMVERBOSE=\$(cat /sys/module/kvm/parameters/dsm_verbose 2>&1)
 echo GVM_START \$(date +%s)
-( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -machine pc,kernel-irqchip=off -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
+( stdbuf -oL -eL ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $((2*lc)) -m $L3MEM -realtime mlock=on -machine pc,kernel-irqchip=off -local-cpu $lc,start=$((g*lc)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 earlyprintk=serial,ttyS0,115200 nokaslr panic=-1 loglevel=8 $L3ARGS" -nographic -no-reboot -net none -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | sed 's/^/L3OUT /' ) &
 for t in 45 150 300; do sleep \$((t - \${last:-0})); last=\$t; pidof qemu-system-x86_64 >/dev/null || break; dbg \$t; echo 0 > /sys/module/kvm/parameters/dsm_verbose 2>/dev/null; done
 pidof qemu-system-x86_64 >/dev/null && { echo GVM_KILL; killall qemu-system-x86_64; sleep 2; }
 echo GVM_END \$(date +%s)
-if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
+if [ $g = 0 ] && [ "${BASE1:-1}" = 1 ]; then echo BASE1_START \$(date +%s); ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp $bc -m $L3MEM -machine pc,kernel-irqchip=off -local-cpu $bc,start=0,iplist="10.89.0.1" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1 $L3ARGS" -nographic -no-reboot -net none 2>&1 | sed "s/^/B1OUT /"; echo BASE1_END \$(date +%s); fi
 /bb/poweroff -f
 EOS
 sudo cp init l2/init; sudo chmod +x l2/init; (cd l2 && sudo find . | sudo cpio -o -H newc 2>/dev/null | gzip -1 > ../l2_$g.gz); }
