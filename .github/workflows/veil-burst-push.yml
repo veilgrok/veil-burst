@@ -1,0 +1,56 @@
+# Push-triggered twin of veil-burst.yml (used where workflow_dispatch returns HTTP 500).
+# Parameters come from burst.json on a burst-* branch. No secrets in the file.
+name: Veil burst (push)
+
+on:
+  push:
+    branches: ["burst-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      indices: ${{ steps.p.outputs.indices }}
+      offset: ${{ steps.p.outputs.offset }}
+      total: ${{ steps.p.outputs.total }}
+      phases: ${{ steps.p.outputs.phases }}
+      hold: ${{ steps.p.outputs.hold }}
+      relay_url: ${{ steps.p.outputs.relay_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        run: |
+          python3 -c "
+          import json,os
+          c=json.load(open('burst.json'))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              for k in ['indices','offset','total','phases','hold','relay_url']:
+                  v=c.get(k,''); f.write(f'{k}={json.dumps(v) if k==\"indices\" else v}\n')
+          "
+  burst:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.setup.outputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run
+        shell: bash
+        env:
+          GIDX: ${{ matrix.index }}
+          OFFSET: ${{ needs.setup.outputs.offset }}
+          TOTAL: ${{ needs.setup.outputs.total }}
+          PHASES: ${{ needs.setup.outputs.phases }}
+          HOLD: ${{ needs.setup.outputs.hold }}
+          VEIL_RELAY_URL: ${{ needs.setup.outputs.relay_url }}
+          VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
+        run: |
+          export GIDX=$((GIDX + OFFSET))
+          bash gha/run.sh
