@@ -3,7 +3,7 @@
 # Per config: host-wall pbench 1t (L2 /proc/uptime), L2 KVM debugfs exit counters over exactly the pbench window, L3 clocksource + timer IRQ delta.
 set -u; J() { echo "VEIL_JSON $1"; }
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$GIDX,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo)}"
-echo STEP apt; timeout 240 sudo apt-get -qq -o Acquire::Retries=3 update >/dev/null 2>&1; timeout 400 sudo apt-get -qq -o Acquire::Retries=3 install -y qemu-system-x86 busybox-static cpio >/dev/null 2>&1; echo "STEP apt rc=$? qemu=$(qemu-system-x86_64 --version | head -1)"; sudo chmod 666 /dev/kvm
+command -v qemu-system-x86_64 >/dev/null || { echo STEP apt; timeout 240 sudo apt-get -qq -o Acquire::Retries=3 update >/dev/null 2>&1; timeout 400 sudo apt-get -qq -o Acquire::Retries=3 install -y qemu-system-x86 busybox-static cpio >/dev/null 2>&1; echo "STEP apt rc=$? qemu=$(qemu-system-x86_64 --version | head -1)"; sudo chmod 666 /dev/kvm; }
 mkdir l2; sudo tar -xzf art/l2root.tar.gz -C l2
 cp art/pbench pbench 2>/dev/null || gcc -O2 -static -pthread -march=x86-64 -mtune=generic -o pbench gha/pbench.c; chmod +x pbench
 for th in 1; do t0=$(date +%s.%N); o=$(./pbench $th 10000000); t1=$(date +%s.%N); echo "L1BARE $o host_wall_s=$(python3 -c "print(round($t1-$t0,3))")"; done
