@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #define PS 4096
-enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD };
+enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ };  /* INVQ: invalidate a clean shared copy, no ack (home already has the data; per-node FIFO keeps order) */
 #define BM 512  /* DIFF/UPD: PS bytes of page + BM-byte bitmap of changed 8-byte words */
 struct msg { uint8_t t, has_data; uint16_t from; uint32_t pad; uint64_t pg; };
 static int xfer(int fd, void *b, size_t n, int wr) { char *p = b; while (n) { ssize_t r = wr ? write(fd, p, n) : read(fd, p, n); if (r <= 0) return -1; p += r; n -= r; } return 0; }
@@ -43,7 +43,8 @@ static int home(int port, size_t np) {
   int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 4)) { perror("bind"); return 1; } fprintf(stderr, "DSM home listening %d pages=%zu\n", port, np);
   int cs[2]; for (int i = 0; i < 2; i++) { int s = accept(ls, 0, 0); setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); uint16_t id; xfer(s, &id, 2, 0); cs[id & 1] = s; fprintf(stderr, "DSM home client %d connected\n", id); }
-  struct q pend[4096]; int npend = 0; struct q def[4096]; double due[4096]; int ndef = 0; double *gt = calloc(np, sizeof(double)); double lease = getenv("VEIL_DSM_LEASE_US") ? atof(getenv("VEIL_DSM_LEASE_US")) / 1e6 : 0; unsigned long ndeferred = 0, nchg = 0, nsame = 0, nchg_hot = 0; size_t lastchg_pg = 0; int lastchg_off = -1; uint32_t hotmin = getenv("VEIL_DSM_HOTMIN") ? atoi(getenv("VEIL_DSM_HOTMIN")) : 50; unsigned long nreq = 0, nrecall = 0, ninv = 0, bytes = 0, nzero = 0; double tl = now(); char tmp[PS + BM]; uint16_t *same = calloc(np, 2); uint8_t *rep = calloc(np, 1); uint32_t repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; long dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; unsigned long nrep = 0, ndiff = 0, ndiffw = 0;
+  struct q pend[4096]; int npend = 0; struct q def[4096]; double due[4096]; int ndef = 0; double *gt = calloc(np, sizeof(double)); double lease = getenv("VEIL_DSM_LEASE_US") ? atof(getenv("VEIL_DSM_LEASE_US")) / 1e6 : 0; unsigned long ndeferred = 0, nchg = 0, nsame = 0, nchg_hot = 0; size_t lastchg_pg = 0; int lastchg_off = -1; uint32_t hotmin = getenv("VEIL_DSM_HOTMIN") ? atoi(getenv("VEIL_DSM_HOTMIN")) : 50; unsigned long nreq = 0, nrecall = 0, ninv = 0, bytes = 0, nzero = 0; double tl = now(); char tmp[PS + BM]; uint16_t *same = calloc(np, 2); uint8_t *rep = calloc(np, 1); int invq = getenv("VEIL_DSM_INVQ") && atoi(getenv("VEIL_DSM_INVQ")); uint32_t repsilent = getenv("VEIL_DSM_REPSILENT") ? atoi(getenv("VEIL_DSM_REPSILENT")) : 0;  /* also replicate any page whose last N writebacks were all unchanged (silent hardware writes) */
+  uint32_t repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; long dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; unsigned long nrep = 0, ndiff = 0, ndiffw = 0;
   /* replicated (read-mostly page-table) page: both nodes writable; nodes ship word diffs vs their twin, home merges + forwards */
   #define DODIFF(cc, PGX) { uint64_t *nw = (uint64_t *)tmp, *hm = (uint64_t *)(mem + (PGX) * PS); uint8_t *bm = (uint8_t *)tmp + PS; for (int w = 0; w < PS / 8; w++) if (bm[w >> 3] >> (w & 7) & 1) { hm[w] = nw[w]; ndiffw++; } wrt[PGX] = 1; ndiff++; struct msg u = {.t = UPD, .has_data = 2, .pg = (PGX)}; if (cs[1 - (cc)] >= 0) { xfer(cs[1 - (cc)], &u, sizeof u, 1); xfer(cs[1 - (cc)], tmp, PS + BM, 1); } }
   /* wait for the ACK for page pg from client c; queue other requests */
@@ -62,7 +63,7 @@ static int home(int port, size_t np) {
     if (pg >= np) { fprintf(stderr, "bad page\n"); continue; }
     if (lease > 0 && owner[pg] == o && hot[pg] >= hotmin && tn - gt[pg] < lease && ndef < 4096) { def[ndef] = cur; due[ndef++] = gt[pg] + lease; ndeferred++; nreq--; continue; }  /* hot page: let the owner keep it for one lease */
     if (rep[pg]) { struct msg r = {.t = DATA_REP, .has_data = 1, .pg = pg}; xfer(cs[c], &r, sizeof r, 1); xfer(cs[c], mem + pg * PS, PS, 1); continue; }
-    if (repmin && same[pg] >= repmin && looks_pt(mem + pg * PS, np) && (owner[pg] == o || (sh[pg] >> o & 1))) {  /* o's copies keep coming back unchanged: replicate instead of ping-ponging */
+    if (repmin && same[pg] >= repmin && (looks_pt(mem + pg * PS, np) || (repsilent && same[pg] >= repsilent)) && (owner[pg] == o || (sh[pg] >> o & 1))) {  /* o's copies keep coming back unchanged: replicate instead of ping-ponging */
       struct msg r = {.t = REPL, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); WAITACK(o, pg); rep[pg] = 1; nrep++;
       struct msg d = {.t = DATA_REP, .has_data = 1, .pg = pg}; xfer(cs[c], &d, sizeof d, 1); xfer(cs[c], mem + pg * PS, PS, 1); bytes += 2 * PS; owner[pg] = -1; sh[pg] = 3; continue; }
     if (cur.m.t == RD) {
@@ -70,7 +71,8 @@ static int home(int port, size_t np) {
       struct msg r = {.t = DATA_S, .has_data = wrt[pg], .pg = pg}; xfer(cs[c], &r, sizeof r, 1); if (wrt[pg]) { xfer(cs[c], mem + pg * PS, PS, 1); bytes += PS; } else nzero++; sh[pg] |= 1 << c;
     } else if (cur.m.t == WR) {
       if (owner[pg] == c) { struct msg r = {.t = GRANT_M, .pg = pg}; xfer(cs[c], &r, sizeof r, 1); continue; } /* duplicate */
-      if (owner[pg] == o || (sh[pg] >> o & 1)) { struct msg r = {.t = INV, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); ninv++; hot[pg]++; WAITACK(o, pg); sh[pg] &= ~(1 << o); }
+      if (invq && owner[pg] != o && (sh[pg] >> o & 1)) { struct msg r = {.t = INVQ, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); ninv++; hot[pg]++; sh[pg] &= ~(1 << o); }
+      else if (owner[pg] == o || (sh[pg] >> o & 1)) { struct msg r = {.t = INV, .pg = pg}; xfer(cs[o], &r, sizeof r, 1); ninv++; hot[pg]++; WAITACK(o, pg); sh[pg] &= ~(1 << o); }
       if (sh[pg] >> c & 1) { struct msg r = {.t = GRANT_M, .pg = pg}; xfer(cs[c], &r, sizeof r, 1); }
       else { struct msg r = {.t = DATA_M, .has_data = wrt[pg], .pg = pg}; xfer(cs[c], &r, sizeof r, 1); if (wrt[pg]) { xfer(cs[c], mem + pg * PS, PS, 1); bytes += PS; } else nzero++; }
       owner[pg] = c; sh[pg] = 0; gt[pg] = now();
