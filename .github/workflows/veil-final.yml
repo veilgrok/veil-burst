@@ -1,0 +1,56 @@
+# Veil final pass: synchronized per-runner benchmarks on standard GitHub-hosted runners.
+# Dispatch only. Uses no repository or Actions secrets. No mining.
+name: Veil final pass
+
+on:
+  workflow_dispatch:
+    inputs:
+      indices:
+        description: JSON list of matrix indices
+        required: true
+        default: "[0]"
+        type: string
+      offset:
+        required: false
+        default: "0"
+        type: string
+      t0:
+        description: Unix epoch barrier for synchronized start (0 = none)
+        required: false
+        default: "0"
+        type: string
+      quick:
+        description: "1 = dry run (small model, no phase offsets)"
+        required: false
+        default: "0"
+        type: string
+      tag:
+        required: false
+        default: ""
+        type: string
+
+run-name: "Veil final ${{ inputs.tag }}"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(inputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Final pass
+        shell: bash
+        env:
+          GIDX: ${{ matrix.index }}
+          OFFSET: ${{ inputs.offset }}
+          T0: ${{ inputs.t0 }}
+          QUICK: ${{ inputs.quick }}
+        run: |
+          export GIDX=$((GIDX + OFFSET))
+          python3 gha/final.py
