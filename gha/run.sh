@@ -14,7 +14,7 @@ if [[ ",$PHASES," == *",veil,"* && -n "${VEIL_RELAY_URL:-}" ]]; then
       --controller 127.0.0.1:7700 --name "r${GIDX}w${i}" --work-ms 0 & pids+=($!)
   done
   t0=$(date +%s.%N)
-  ( sleep ${VEIL_TIMEOUT:-420}; kill ${pids[@]} 2>/dev/null ) & KP=$!
+  ( sleep ${VEIL_TIMEOUT:-120}; kill ${pids[@]} 2>/dev/null ) & KP=$!
   wait ${pids[@]}
   kill $KP 2>/dev/null
   echo "VEIL_JSON {\"kind\":\"veil\",\"t\":$(date +%s.%N),\"t0\":$t0,\"gidx\":$GIDX,\"workers\":$N}"
