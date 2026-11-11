@@ -37,8 +37,8 @@ chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3x
 # stamp + summarize: host wall time between markers on the BSP serial
 stamp() { n=$1; while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB1_START*) a=$now;; *PB2_START*) b=$now; L "PROF $n pb1_wall_s=$(python3 -c "print(round($b-$a,3))")";; *MT_START*) c=$now; L "PROF $n pb2_wall_s=$(python3 -c "print(round($c-$b,3))")";; *XC_START*) d=$now; L "PROF $n mt_wall_s=$(python3 -c "print(round($d-$c,3))")";; *PB_DONE*) L "PROF $n xc_wall_s=$(python3 -c "print(round($now-$d,3))")"; (sleep 3; pkill -9 -f opt/gvm/qemu-system; pkill -9 -f "qemu-system-x86_64 -enable-kvm") & ;; esac
   case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*"Total of"*|*"Command line"*|*rror*|*panic*|*DSM*|*"set kvmclock"*|*"RTT"*|*smp*|*SMP*|*CPU1*|*CPU1_ON*|*"x86:"*|*lockup*|*rcu*|*Stuck*|*stuck*|*NMI*|*"Run /init"*|*Freeing*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
-GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp 2 -m 512 -kernel /w/${KIMG:-gha/bin/bz100-4.18.20-hz100} -initrd /w/l3x.gz -nographic -no-reboot -net none"
-GA="console=ttyS0 panic=-1 no_timer_check noapic ${GAX:-no-kvmclock nokaslr tsc=reliable lpj=24000000}"; GAS="$GA maxcpus=1"  # split: boot on CPU0, init onlines CPU1
+GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp 2 -m 512 -kernel /w/${KIMG:-gha/bin/bz-4.18.20-hz100-nohzfull} -initrd /w/l3x.gz -nographic -no-reboot -net none"
+GA="console=ttyS0 panic=-1 no_timer_check noapic ${GAX:-no-kvmclock nokaslr tsc=reliable lpj=24000000}"; GAS="$GA maxcpus=1 nohz_full=1 rcu_nocbs=1"  # split: boot on CPU0, init onlines CPU1
 SHIM="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil"
 watch_mon() { for t in ${WATCHT:-120 300 600 900 1200}; do sleep $((t - ${pt:-0})); pt=$t; for p in "$@"; do python3 - $p <<'PY' 2>/dev/null | tr -d '\r' | grep -aE "CPU #" | sed "s/^/MON t=$t :$p /" | while IFS= read -r x; do L "$x"; done
 import socket,sys,time
@@ -60,7 +60,7 @@ run_split_local() { n=$1; shm0=$2; shm1=$3; env0=$4; T0=$(date +%s.%N); rm -f /d
 if [ $G = 0 ] && has B; then
   for i in 1 2; do t0=$(date +%s.%N); o=$(./pbench 1 10000000); t1=$(date +%s.%N); o2=$(./pbench 2 10000000); t2=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))")"; done
   # two-level stock QEMU 10 memfd, 2 vCPUs (the comparison target)
-  T0=$(date +%s.%N); timeout -s KILL 180 qemu-system-x86_64 -enable-kvm -smp 2 -m 512 -cpu kvm64 -kernel ${KIMG:-gha/bin/bz100-4.18.20-hz100} -initrd l3x.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A2_memfd; L "CFG_END A2"
+  T0=$(date +%s.%N); timeout -s KILL 180 qemu-system-x86_64 -enable-kvm -smp 2 -m 512 -cpu kvm64 -kernel ${KIMG:-gha/bin/bz-4.18.20-hz100-nohzfull} -initrd l3x.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A2_memfd; L "CFG_END A2"
   # QEMU-gvm single process 2 vCPUs, userspace APIC (cost of the gvm VMM itself)
   T0=$(date +%s.%N); timeout -s KILL 240 chroot /l2r $GQ -append "$GA" 2>&1 | stamp G1_gvm; L "CFG_END G1"
 fi
