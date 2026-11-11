@@ -1,0 +1,27 @@
+# Geekbench 6 variants (dispatch only, no secrets).
+name: Veil GB6
+on:
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: JSON list of {"ver":..,"mode":..}
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  gb6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        v: ${{ fromJSON(inputs.variants) }}
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        env:
+          GBV: ${{ matrix.v.ver }}
+          GBMODE: ${{ matrix.v.mode }}
+          GIDX: ${{ strategy.job-index }}
+        run: python3 gha/gb6.py
