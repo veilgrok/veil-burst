@@ -57,3 +57,5 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
   }
   return p;
 }
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) __attribute__((alias("mmap")));
+__attribute__((constructor)) static void hello(void) { if (getenv("VEIL_UFFD_MATCH")) fprintf(stderr, "UFFD shim loaded pid=%d\n", getpid()); }

@@ -27,7 +27,7 @@ chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3.
 sudo cp art/bzImage l3.gz pbench l2/opt/gvm/
 # ---- Phase A: TWO levels. Stock QEMU on the L1 runner runs the same L3 kernel+initrd directly (it becomes an L2 guest).
 ksnap() { sudo sh -c 'for f in /sys/kernel/debug/kvm/*; do [ -f "$f" ] && echo "${f##*/} $(cat $f)"; done' 2>/dev/null; }
-runA() { n=$1; shift; echo "CFG_START $n"; timeout 300 "$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now; ksnap > /tmp/a0;; *PBENCH*) ksnap > /tmp/a1; echo "PROF $n wall_s=$(python3 -c "print(round($now-$t0,3))") $(awk 'NR==FNR{a[$1]=$2;next}{d=$2-a[$1]; if(d>0) printf "%s=%d ",$1,d}' /tmp/a0 /tmp/a1)";; esac; case "$l" in *L3*|*IRQ*|*PBENCH*|*clocksource*|*UFFD*|qemu-system*|*rror*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
+runA() { n=$1; shift; echo "CFG_START $n"; timeout 300 "$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do now=$(date +%s.%N); case "$l" in *PB_START*) t0=$now; ksnap > /tmp/a0;; *PBENCH*) ksnap > /tmp/a1; echo "PROF $n wall_s=$(python3 -c "print(round($now-$t0,3))") $(awk 'NR==FNR{a[$1]=$2;next}{d=$2-a[$1]; if(d>0) printf "%s=%d ",$1,d}' /tmp/a0 /tmp/a1)";; esac; case "$l" in *L3*|*IRQ*|*PBENCH*|*clocksource*|*UFFD*|qemu-system*|*rror*|*ERROR*|*ld.so*) echo "[$n] $l";; esac; done; echo "CFG_END $n"; }
 sudo cp /boot/vmlinuz-$(uname -r) k6; sudo chmod 644 k6; gcc -O2 -shared -fPIC -o uffd_shim.so gha/uffd_shim.c -ldl -lpthread && echo STEP shim built
 A="qemu-system-x86_64 -enable-kvm -smp 1 -m 512 -initrd l3.gz"
 NA="console=ttyS0 panic=-1 noapic no_timer_check"; DF="console=ttyS0 panic=-1"
@@ -54,7 +54,7 @@ cd /opt/gvm
 echo "L2 kvm=\$(ls -la /dev/kvm 2>&1) gvmq=\$(./qemu-system-x86_64 --version 2>&1 | head -1) timeout=\$(command -v timeout)"
 snap() { for f in /sys/kernel/debug/kvm/*; do [ -f "\$f" ] && echo "\${f##*/} \$(cat \$f)"; done; }
 ktr() { T=/sys/kernel/debug/tracing; [ -d \$T/events/kvm/kvm_exit ] || { echo "TRACE none"; return; }; echo > \$T/trace; echo 1 > \$T/events/kvm/kvm_exit/enable; sleep 2; echo 0 > \$T/events/kvm/kvm_exit/enable; grep -o 'reason [A-Z_]*' \$T/trace | sort | uniq -c | sort -rn | head -8 | tr '\n' ';' | sed 's/^/TRACE2s /'; echo; }
-run() { n=\$1; shift; echo "CFG_START \$n"; timeout 300 "\$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do read up x </proc/uptime; case "\$l" in *PB_START*) t0=\$up; snap > /tmp/s0; (sleep 3; ktr) & ;; *PBENCH*) snap > /tmp/s1; echo "PROF \$n wall_s=\$(awk "BEGIN{print \$up-\$t0}") \$(awk 'NR==FNR{a[\$1]=\$2;next}{d=\$2-a[\$1]; if(d>0) printf "%s=%d ",\$1,d}' /tmp/s0 /tmp/s1)";; esac; echo "[\$n] @\$up \$l"; done; echo "CFG_END \$n"; }
+run() { n=\$1; shift; echo "CFG_START \$n"; timeout -t 300 "\$@" -nographic -no-reboot -net none 2>&1 | while IFS= read -r l; do read up x </proc/uptime; case "\$l" in *PB_START*) t0=\$up; snap > /tmp/s0; (sleep 3; ktr) & ;; *PBENCH*) snap > /tmp/s1; echo "PROF \$n wall_s=\$(awk "BEGIN{print \$up-\$t0}") \$(awk 'NR==FNR{a[\$1]=\$2;next}{d=\$2-a[\$1]; if(d>0) printf "%s=%d ",\$1,d}' /tmp/s0 /tmp/s1)";; esac; echo "[\$n] @\$up \$l"; done; echo "CFG_END \$n"; }
 K=bzImage; I=l3.gz; NA="console=ttyS0 panic=-1 noapic no_timer_check"; DF="console=ttyS0 panic=-1"
 GVM="./qemu-system-x86_64 -L /opt/gvm -enable-kvm -smp 1 -m 512 -local-cpu 1,start=0,iplist=10.89.0.1 -kernel \$K -initrd \$I"
 STK="/usr/bin/qemu-system-x86_64 -enable-kvm -smp 1 -m 512 -kernel \$K -initrd \$I"
