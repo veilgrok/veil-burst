@@ -1,5 +1,5 @@
 diff --git a/Linux-DSM-4.18/arch/x86/kvm/ktcp.c b/Linux-DSM-4.18/arch/x86/kvm/ktcp.c
-index cb08e1399..070c8fc76 100644
+index cb08e1399..20a631952 100644
 --- a/Linux-DSM-4.18/arch/x86/kvm/ktcp.c
 +++ b/Linux-DSM-4.18/arch/x86/kvm/ktcp.c
 @@ -199,7 +199,8 @@ read_again:
@@ -12,20 +12,22 @@ index cb08e1399..070c8fc76 100644
  	}
  
  	// Non-blocking on the first try
-@@ -209,6 +210,12 @@ read_again:
+@@ -209,6 +210,14 @@ read_again:
  	}
  
  	if (ret == -EAGAIN || ret == -ERESTARTSYS) {
 +		/* mid-message: yield instead of spinning with rlock held, so the
 +		 * rest of the segments (and softirq RX) can make progress */
++		/* never busy-spin a DSM kthread in KVM_RUN context: it starved the
++		 * L2 host (watchdog sleeps ran 10+ min late in run 43019277369) */
 +		if (len > 0)
 +			usleep_range(5, 20);
 +		else
-+			cond_resched();
++			usleep_range(20, 50);
  		goto read_again;
  	}
  	else if (ret < 0) {
-@@ -217,7 +224,7 @@ read_again:
+@@ -217,7 +226,7 @@ read_again:
  	}
  	len += ret;
  	if (len != expected_size) {
