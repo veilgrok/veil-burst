@@ -4,11 +4,12 @@ on:
     inputs:
       relay_url: {required: true, type: string}
       art_run: {required: true, type: string}
+      n: {required: false, default: "[0,1]", type: string}
       cfgsu: {required: false, default: "U_memfd U_uffd U_rem U_pipe_b16_ra16 U_pipe_b64_ra8 U_pipe_b16_ra64 U_pipe_b64_ra32 U_pev_b16_ra16_e128 U_rem_evict U_memfd2 U_uffd2 U_pipe_b64_ra32_2", type: string}
 permissions: {contents: read, actions: read}
 jobs:
   node:
-    strategy: {fail-fast: false, matrix: {gidx: [0, 1]}}
+    strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -19,8 +20,9 @@ jobs:
         env:
           GIDX: ${{ matrix.gidx }}
           CFGSU: ${{ inputs.cfgsu }}
+          NN: ${{ strategy.job-total }}
           VEIL_RELAY_URL: ${{ inputs.relay_url }}
           VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
         run: |
           sudo sysctl -qw vm.unprivileged_userfaultfd=1; sudo modprobe wireguard || true
-          docker run --rm --privileged --network host -v /dev:/dev -v $GITHUB_WORKSPACE:/w -w /w -e GIDX -e CFGSU -e GITHUB_RUN_ID -e VEIL_RELAY_URL -e VEIL_RELAY_TOKEN debian:trixie bash -c 'export DEBIAN_FRONTEND=noninteractive; timeout 600 apt-get -qq update >/dev/null 2>&1; timeout 900 apt-get -qq install -y --no-install-recommends qemu-system-x86 busybox-static cpio gcc libc6-dev python3 util-linux iproute2 iputils-ping wireguard-tools curl ca-certificates >/dev/null 2>&1; echo "STEP docker-apt rc=$? $(qemu-system-x86_64 --version | head -1)"; bash gha/uspan.sh'
+          docker run --rm --privileged --network host -v /dev:/dev -v $GITHUB_WORKSPACE:/w -w /w -e GIDX -e NN -e CFGSU -e GITHUB_RUN_ID -e VEIL_RELAY_URL -e VEIL_RELAY_TOKEN debian:trixie bash -c 'export DEBIAN_FRONTEND=noninteractive; timeout 600 apt-get -qq update >/dev/null 2>&1; timeout 900 apt-get -qq install -y --no-install-recommends qemu-system-x86 busybox-static cpio gcc libc6-dev python3 util-linux iproute2 iputils-ping wireguard-tools curl ca-certificates >/dev/null 2>&1; echo "STEP docker-apt rc=$? $(qemu-system-x86_64 --version | head -1)"; bash gha/uspan.sh'

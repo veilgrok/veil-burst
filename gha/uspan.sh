@@ -1,7 +1,20 @@
 #!/bin/bash
 # Two-level Veil DSM: stock QEMU 10 + KVM on the L1 runner; guest RAM = shmem memfd paged by the userfaultfd shim.
 # gidx 1 = memory node (memsrv serves remote pages over WireGuard); gidx 0 = compute node (all vCPUs) + timed configs.
-set -u; G=$GIDX; P=$((1-G)); RUN=$GITHUB_RUN_ID; J() { echo "VEIL_JSON $1"; }; K() { python3 gha/kv.py "$@"; }
+set -u; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }
+if [ "${NN:-2}" -gt 2 ]; then  # pick a same-region pair among NN runners (lowest gidx wins); others exit
+  REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); K put us-$RUN-reg-$G "$REG"
+  ALL=$(K wait us-$RUN-reg- $NN 300) || ALL=$(K wait us-$RUN-reg- 2 5)
+  SEL=$(echo "$ALL" | python3 -c "
+import json,sys; d={int(k.rsplit('-',1)[1]):v for k,v in json.load(sys.stdin).items()}; ks=sorted(d); p=None
+for i in ks:
+  for j in ks:
+    if j>i and d[i]==d[j] and p is None: p=(i,j)
+p=p or (ks[0],ks[1]); print(p[0],p[1],d[p[0]],d[p[1]])")
+  read PA PB RA_ RB_ <<< "$SEL"; echo "VEIL_JSON {\"kind\":\"pick\",\"gidx\":$G,\"pair\":\"$PA $PB\",\"regions\":\"$RA_ $RB_\"}"
+  if [ "$G" = "$PA" ]; then G=0; elif [ "$G" = "$PB" ]; then G=1; else echo "not picked"; exit 0; fi
+fi
+P=$((1-G)); RUN=$GITHUB_RUN_ID; J() { echo "VEIL_JSON $1"; }; K() { python3 gha/kv.py "$@"; }
 CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1); J "{\"kind\":\"node\",\"gidx\":$G,\"cpu\":\"$CPU\",\"vmx\":$(grep -c -w vmx /proc/cpuinfo),\"region\":\"$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')\"}"
 gcc -O2 -shared -fPIC -o uffd_shim.so gha/uffd_shim.c -ldl -lpthread && gcc -O2 -o memsrv gha/memsrv.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -static -pthread -o pbench gha/pbench.c || { echo "build failed"; exit 1; }
 # --- WireGuard over hole-punched UDP
