@@ -4,10 +4,10 @@
 # de-replication, optional synchronous mirror + client failover). K runners meshed with WireGuard.
 #  MODES (one): B2  baselines (bare, stock QEMU 10 memfd 2/4 vCPU)      S3  same-runner split (2 QEMU-gvm, localhost)
 #               X2  2 runners x 1 vCPU (home on node0)                 X4  2 runners x 2 vCPU
-#               X3  3 runners x 1 vCPU                                 R   4 runners: 2 x 1 vCPU + primary home + mirror;
-#                                                                          the primary-home runner is killed at KILLAT
-set -u; MODE=${MODES%% *}; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
-case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=4 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
+#               X3  3 runners x 1 vCPU                                 R   3 runners (see below)
+#   R: 3 runners: node0 BSP + mirror home, node1 AP, node2 primary home (killed at KILLAT)
+set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
+case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
   K put vs-$RUN-reg-$G "$REG|$V"; ALL=$(K wait vs-$RUN-reg- $NN $([ $KN -gt 2 ] && echo 900 || echo 300)) || ALL=$(K wait vs-$RUN-reg- $KN 5)
@@ -89,19 +89,18 @@ for k,v in d.items():
   if i!=$G: print(i,p['ip'],p['port'],p['pub'])" | while read i ip port pub; do wg set wg0 peer $pub endpoint $ip:$port allowed-ips 10.88.0.$((i+1))/32 persistent-keepalive 1; done
 sleep 4; for i in $(seq 0 $((KN-1))); do [ $i = $G ] || J "{\"kind\":\"wg_ping\",\"from\":$G,\"to\":$i,\"out\":\"$(ping -c 20 -i 0.2 10.88.0.$((i+1)) | tail -1)\"}"; done
 IPL=""; for i in $(seq 0 $((NCOMP-1))); do IPL="$IPL 10.88.0.$((i+1))"; done; IPL=${IPL# }
-if [ "$MODE" = R ]; then HOMEN=2; H2="VEIL_DSM_HOME2=10.88.0.4:7910 VEIL_DSM_FAILOVER_S=4"; else HOMEN=0; H2=""; fi
+if [ "$MODE" = R ]; then HOMEN=2; H2="VEIL_DSM_HOME2=10.88.0.1:7920 VEIL_DSM_FAILOVER_S=${FOS:-8}"; else HOMEN=0; H2=""; fi
 HIP=10.88.0.$((HOMEN+1)); XT=${XT:-900}; rm -f /dev/shm/veil*; T0=$(date +%s.%N)
 homelog() { f=$1; tag=$2; (while sleep 20; do tail -2 $f | while IFS= read -r x; do L "[$tag] $x"; done; done &) ; }
-if [ "$MODE" = R ] && [ $G = 3 ]; then env $E timeout -s KILL $XT ./dsmh mirror 7910 131072 $NCOMP 7911 2> mirror.log & homelog mirror.log mirror; K put vs-$RUN-mirror-0 1 >/dev/null
-  K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 3; grep -aE "TAKEOVER|RESUMED|resumed|lost" mirror.log | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; exit 0; fi
+if [ "$MODE" = R ] && [ $G = 0 ]; then env $E timeout -s KILL $XT ./dsmh mirror 7920 131072 $NCOMP 7921 2> mirror.log & homelog mirror.log mirror; K put vs-$RUN-mirror-0 1 >/dev/null; fi
 if [ $G = $HOMEN ]; then
-  MARG=""; [ "$MODE" = R ] && { K wait vs-$RUN-mirror- 1 600 >/dev/null; MARG=10.88.0.4:7911; }
+  MARG=""; [ "$MODE" = R ] && { K wait vs-$RUN-mirror- 1 600 >/dev/null; MARG=10.88.0.1:7921; }
   env $E timeout -s KILL $XT ./dsmh home 7910 131072 $NCOMP $MARG 2> home.log & HPID=$!; homelog home.log home; sleep 0.5; K put vs-$RUN-home-0 1 >/dev/null
   if [ "$MODE" = R ]; then K wait vs-$RUN-kill- 1 $XT >/dev/null; L "FAULT_INJECTION killing primary home runner state: $(grep -a 'DSM home t=' home.log | tail -1 | cut -c1-200)"; kill -9 $HPID; pkill -9 -f dsmh; ip link del wg0; L "FAULT_INJECTED primary home process killed + its network removed"; exit 0; fi
 fi
 if [ $G -lt $NCOMP ]; then K wait vs-$RUN-home- 1 600 >/dev/null; LC=$((SMP/NCOMP)); ST=$((G*LC))
   if [ $G = 0 ]; then (WATCHT="150 300 600" watch_mon 4444 &); timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu $LC,start=0,iplist="$IPL" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $MODE
-    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done
+    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f mirror.log ] && { grep -aE "TAKEOVER|takeover|resum|LOST|lost|refused" mirror.log | head -8 | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; }; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done
   else timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=$G $GQ -shm-path veilB -append "$GA" -local-cpu $LC,start=$ST,iplist="$IPL" -monitor tcp:127.0.0.1:4445,server,nowait > ap.log 2>&1 & QP=$!; (WATCHT="150 300 600" watch_mon 4445 &)
     (while sleep 30; do grep -a "DSM node$G" ap.log | tail -3 | while IFS= read -r x; do L "[ap$G] $x"; done; done &); K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 3; kill -9 $QP 2>/dev/null
     grep -aE "DSM node$G|FAILOVER|lost" ap.log | tail -4 | while IFS= read -r x; do L "[ap$G-final] $x"; done; fi
