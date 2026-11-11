@@ -32,10 +32,10 @@ mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev
 exec >/dev/ttyS0 2>&1 </dev/null
 ip link set lo up; ip link set eth0 up; ip addr add $ME/32 dev eth0; ip route add 10.90.$G.1 dev eth0; ip route add default via 10.90.$G.1
 echo L2 nproc=\$(nproc) vmx=\$(grep -c -w vmx /proc/cpuinfo) svm=\$(grep -c -w svm /proc/cpuinfo) \$(grep MemTotal /proc/meminfo); ls -l /dev/kvm
-/opt/gvm/pbench \$(nproc) 10000000 | sed 's/^/L2BARE /'
+/opt/gvm/pbench 1 10000000 | sed "s/^/L2BARE /"; /opt/gvm/pbench \$(nproc) 10000000 | sed 's/^/L2BARE /'
 sleep 2
 echo GVM_START \$(date +%s)
-cd /opt/gvm; timeout 900 ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 8 -m 3072 -local-cpu 4,start=$((G*4)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
+cd /opt/gvm; ./qemu-system-x86_64 -L /opt/gvm -enable-kvm -cpu kvm64 -smp 8 -m 3072 -local-cpu 4,start=$((G*4)),iplist="$NODES" -kernel bzImage -initrd l3.gz -append "console=ttyS0 panic=-1" -nographic -no-reboot -net none 2>&1 | sed 's/^/L3OUT /'
 echo GVM_END \$? \$(date +%s); dmesg | grep -i -E "dsm|ktcp" | tail -8 | sed 's/^/L2DMESG /'
 /bb/poweroff -f
 EOS
