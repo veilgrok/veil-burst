@@ -56,6 +56,14 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER, smu = PTHREAD_MUTEX_INITI
 static volatile unsigned long nfault_r, nfault_w, nfault_wp, nrecv, nrecall_c, ninv_c, nzero_c, nstall, nunsol, seqerr_c, nfailover; static double stall_sum, *fault_t0; static unsigned long nfence, nfence_to; static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t fcv = PTHREAD_COND_INITIALIZER; static volatile uint64_t fdone, fgen; static volatile int need_fence, fence_grants; static uint32_t sseq, rseq;
 /* writebacks sent to the home but not yet known to be mirrored: cleared by the next message from the home (it mirrors before replying) */
 static uint32_t *ghost_pg; static char *ghost_data; static int nghost, maxghost = 4096; static pthread_mutex_t gmu = PTHREAD_MUTEX_INITIALIZER;
+/* Each recorded writeback is flagged (ACK from=GHOSTF) and numbered. Every message from the home carries, in `from`, how many
+   flagged writebacks of this node it has received AND mirrored; only those are forgotten. (The old rule, "forget everything on
+   the next message from the home", dropped pages the home had not read yet when recalls arrive as a burst.) */
+#define GHOSTF 0x100
+static uint32_t gseq, *ghost_seq; static unsigned long nghost_full;
+static int ghost_add(uint64_t pg) { int ok = 0; pthread_mutex_lock(&gmu); if (nghost < maxghost) { ghost_pg[nghost] = pg; ghost_seq[nghost] = ++gseq; memcpy(ghost_data + (size_t)nghost * PS, base + pg * PS, PS); nghost++; ok = 1; } else nghost_full++; pthread_mutex_unlock(&gmu); return ok; }
+static void ghost_confirm(uint16_t conf) { pthread_mutex_lock(&gmu); int k = 0; while (k < nghost && (int16_t)(conf - (uint16_t)ghost_seq[k]) >= 0) k++;
+  if (k) { nghost -= k; memmove(ghost_pg, ghost_pg + k, nghost * 4); memmove(ghost_seq, ghost_seq + k, nghost * 4); memmove(ghost_data, ghost_data + (size_t)k * PS, (size_t)nghost * PS); } pthread_mutex_unlock(&gmu); }
 static int xfer(int fd, void *b, size_t n, int wr) { char *p = b; while (n) { ssize_t r = wr ? write(fd, p, n) : read(fd, p, n); if (r <= 0) return -1; p += r; n -= r; } return 0; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void sendm_locked(struct msg *m, void *data, size_t dl) { m->seq = sseq++; xfer(sock, m, sizeof *m, 1); if (data) xfer(sock, data, dl, 1); }
@@ -75,12 +83,12 @@ static int failover(void) {
   sseq = rseq = 0; uint16_t id16 = myid | 0x8000; xfer(sock, &id16, 2, 1);
   uint32_t n = 0; for (size_t i = 0; i < np; i++) n += st[i] != 0; xfer(sock, &n, 4, 1);
   char *eb = malloc(5 * (size_t)n + 1), *e = eb; for (uint32_t i = 0; i < np; i++) if (st[i]) { memcpy(e, &i, 4); e[4] = st[i] == 4 ? 1 : st[i]; e += 5; } xfer(sock, eb, e - eb, 1); free(eb);
-  pthread_mutex_lock(&gmu); uint32_t ng = nghost; xfer(sock, &ng, 4, 1); for (int i = 0; i < nghost; i++) { xfer(sock, &ghost_pg[i], 4, 1); xfer(sock, ghost_data + (size_t)i * PS, PS, 1); } nghost = 0; pthread_mutex_unlock(&gmu);
+  pthread_mutex_lock(&gmu); uint32_t ng = nghost; xfer(sock, &ng, 4, 1); for (int i = 0; i < nghost; i++) { xfer(sock, &ghost_pg[i], 4, 1); xfer(sock, ghost_data + (size_t)i * PS, PS, 1); ghost_seq[i] = i + 1; } gseq = nghost; pthread_mutex_unlock(&gmu);  /* kept until the new home's first message confirms them: the standby may refuse this connection while it still believes the primary is alive */
   uint32_t nr = nrepl; xfer(sock, &nr, 4, 1); for (uint32_t i = 1; i <= nrepl; i++) { uint32_t pg = reppg[i]; xfer(sock, &pg, 4, 1); xfer(sock, base + (size_t)pg * PS, PS, 1); }
   int nre = 0; for (size_t pg = 0; pg < np; pg++) if (pending[pg]) { struct msg q = {.t = pending[pg], .from = myid, .pg = pg}; sendm_locked(&q, 0, 0); nre++; }
   pthread_mutex_unlock(&smu); nfailover++;
   fprintf(stderr, "DSM node%d: FAILOVER done in %.3fs (states=%u unmirrored_wb=%u replicated=%u reissued=%d)\n", myid, now() - t0, n, ng, nr, nre); return 0; }
-static unsigned long nswin, nswfail, nbatch_out, nbatch_in, nping; static volatile double last_rx;
+static unsigned long nswin, nswfail, nbatch_out, nbatch_in, nping, nclean; static int cleanack; static volatile double last_rx;
 /* single-writer replica update: the guest sees either the whole old page or the whole new one (seqcount-safe):
    the page is read-only here (WP), so copy it, merge the writer's bits, punch it out (vCPU reads now block in uffd), install */
 static void swinstall(uint64_t pg, const uint64_t *nw, const uint64_t *mk, char *ib) {
@@ -90,14 +98,19 @@ static void swinstall(uint64_t pg, const uint64_t *nw, const uint64_t *mk, char 
   struct uffdio_copy c = {.dst = (uintptr_t)pp, .src = (uintptr_t)ib, .len = PS, .mode = UFFDIO_COPY_MODE_WP};
   if (ioctl(uffd, UFFDIO_COPY, &c)) { nswfail++; setwp(pg, 0); memcpy(pp, ib, PS); setwp(pg, 1); } nswin++; wake(pg); }
 static void relflush(void);
+#define RB (256 << 10)
+static char *srb; static uint32_t srh, srt_;  /* receiver-thread read buffer; failover() empties it */
+static int srd(void *b, size_t n) { char *p = b; if (!srb) srb = malloc(RB);
+  while (n) { if (srh == srt_) { ssize_t r = read(sock, srb, RB); if (r <= 0) { srh = srt_ = 0; return -1; } srh = 0; srt_ = r; }
+    size_t k = srt_ - srh; if (k > n) k = n; memcpy(p, srb + srh, k); srh += k; p += k; n -= k; } return 0; }
 static void *receiver(void *a) {
   char *buf = aligned_alloc(PS, PS + BM), *ib = aligned_alloc(PS, PS);
-  for (;;) { struct msg m; if (xfer(sock, &m, sizeof m, 0)) { if (failover() == 0) continue; fprintf(stderr, "DSM recv: home closed\n"); return 0; }
+  for (;;) { struct msg m; if (srd(&m, sizeof m)) { if (failover() == 0) continue; fprintf(stderr, "DSM recv: home closed\n"); return 0; }
     if (m.seq != rseq) seqerr_c++; rseq = m.seq + 1; uint64_t pg = m.pg; nrecv++; last_rx = now();
-    if (nghost) { pthread_mutex_lock(&gmu); nghost = 0; pthread_mutex_unlock(&gmu); }
+    if (nghost) ghost_confirm(m.from);
     if (m.t == FENCE && (m.pg >> 62)) { struct msg r = {.t = ACK, .from = myid, .pg = m.pg}; pthread_mutex_lock(&smu); sendm_locked(&r, 0, 0); pthread_mutex_unlock(&smu); continue; }
     if (m.t == FENCE) { pthread_mutex_lock(&fmu); fdone = m.pg; pthread_cond_broadcast(&fcv); pthread_mutex_unlock(&fmu); continue; }
-    if (m.t == UPD) { if (xfer(sock, buf, PS + BM, 0)) continue; uint64_t *mk = (uint64_t *)(buf + PS), *nw = (uint64_t *)buf, *pw = (uint64_t *)(base + pg * PS);
+    if (m.t == UPD) { if (srd(buf, PS + BM)) continue; uint64_t *mk = (uint64_t *)(buf + PS), *nw = (uint64_t *)buf, *pw = (uint64_t *)(base + pg * PS);
       if (st[pg] == 4) { swinstall(pg, nw, mk, ib); nupd_in++; continue; }
       pthread_mutex_lock(&rmu); uint32_t i = repidx[pg];
       if (i) for (int w = 0; w < PS / 8; w++) if (mk[w]) { uint64_t o = __atomic_load_n(&pw[w], __ATOMIC_RELAXED), n; do n = (o & ~mk[w]) | (nw[w] & mk[w]); while (!__atomic_compare_exchange_n(&pw[w], &o, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)); twin[i][w] = (twin[i][w] & ~mk[w]) | (nw[w] & mk[w]); } if (!i) { nupd_drop++; if (nupd_drop < 6) fprintf(stderr, "DSM node%d UPD for non-replicated pg=%llx st=%d\n", myid, (unsigned long long)pg, st[pg]); } pthread_mutex_unlock(&rmu); nupd_in++; continue; }
@@ -110,7 +123,7 @@ static void *receiver(void *a) {
       st[pg] = 1; pthread_mutex_unlock(&rmu); struct msg r = {.t = ACK, .pg = pg}; sendm(&r, 0); continue; }
     if (m.t == UPDB) {  /* group swap: prepare all merged pages, punch them all (reads block), install them all */
       static char *ub, *ibs; static uint64_t pgs[SWB]; const size_t E = 8 + PS + BM; uint32_t k = (uint32_t)m.pg; if (!ub) { ub = malloc(SWB * E); ibs = aligned_alloc(PS, SWB * PS); }
-      if (k > SWB || xfer(sock, ub, k * E, 0)) continue; int q = 0; nbatch_in++;
+      if (k > SWB || srd(ub, k * E)) continue; int q = 0; nbatch_in++;
       for (uint32_t j = 0; j < k; j++) { char *e = ub + j * E; uint64_t p = *(uint64_t *)e; uint64_t *nw = (uint64_t *)(e + 8), *mk = (uint64_t *)(e + 8 + PS); nupd_in++;
         if (p >= np || st[p] != 4) { nupd_drop++; continue; } uint64_t *iw = (uint64_t *)(ibs + q * PS); memcpy(iw, base + p * PS, PS);
         for (int w = 0; w < PS / 8; w++) if (mk[w]) iw[w] = (iw[w] & ~mk[w]) | (nw[w] & mk[w]); pgs[q++] = p; }
@@ -127,29 +140,33 @@ static void *receiver(void *a) {
         if (any) { struct msg r = {.t = DIFF, .has_data = 2, .pg = pg}; pthread_mutex_lock(&smu); sendm_locked(&r, buf, PS + BM); pthread_mutex_unlock(&smu); ndiff_out++; }
         free(twin[i]); twin[i] = twin[nrepl]; reppg[i] = reppg[nrepl]; repidx[reppg[i]] = i; repidx[pg] = 0; nrepl--; }
       st[pg] = 4; pthread_mutex_unlock(&rmu); struct msg r = {.t = ACK, .pg = pg}; sendm(&r, 0); continue; }
-    if (m.t == SWDATA) { if (xfer(sock, buf, PS, 0)) continue; m.has_data = 0; struct uffdio_copy c = {.dst = (uintptr_t)base + pg * PS, .src = (uintptr_t)buf, .len = PS, .mode = UFFDIO_COPY_MODE_WP};
+    if (m.t == SWDATA) { if (srd(buf, PS)) continue; m.has_data = 0; struct uffdio_copy c = {.dst = (uintptr_t)base + pg * PS, .src = (uintptr_t)buf, .len = PS, .mode = UFFDIO_COPY_MODE_WP};
       if (ioctl(uffd, UFFDIO_COPY, &c)) { setwp(pg, 1); swinstall(pg, (uint64_t *)buf, 0, ib); } st[pg] = 4; }
     else if (m.t == SWGRANT) { char *pp = base + pg * PS;  /* become the single writer (our replica is current: all UPDs came first) */
-      if (m.has_data) { if (xfer(sock, buf, PS, 0)) continue; m.has_data = 0; struct uffdio_copy c = {.dst = (uintptr_t)pp, .src = (uintptr_t)buf, .len = PS, .mode = 0}; if (ioctl(uffd, UFFDIO_COPY, &c)) { setwp(pg, 0); memcpy(pp, buf, PS); } }
+      if (m.has_data) { if (srd(buf, PS)) continue; m.has_data = 0; struct uffdio_copy c = {.dst = (uintptr_t)pp, .src = (uintptr_t)buf, .len = PS, .mode = 0}; if (ioctl(uffd, UFFDIO_COPY, &c)) { setwp(pg, 0); memcpy(pp, buf, PS); } }
       addrep(pg, pp); setwp(pg, 0); st[pg] = 2; }
     else if (m.t == REPL) { char *pp = base + pg * PS; addrep(pg, pp); setwp(pg, 0); st[pg] = 3; struct msg r = {.t = ACK, .has_data = 1, .pg = pg}; sendm(&r, pp); continue; }
     if ((m.t == DATA_M || m.t == GRANT_M) && fence_grants) need_fence = 1;  /* our ownership may have ack-free invalidated other copies: next interrupt waits until they are applied */
-    if (m.has_data) { if (xfer(sock, buf, PS, 0)) continue; } else if (m.t == DATA_S || m.t == DATA_M) { memset(buf, 0, PS); nzero_c++; }
+    if (m.has_data) { if (srd(buf, PS)) continue; } else if (m.t == DATA_S || m.t == DATA_M) { memset(buf, 0, PS); nzero_c++; }
     if (m.t == DATA_S || m.t == DATA_M) { struct uffdio_copy c = {.dst = (uintptr_t)base + pg * PS, .src = (uintptr_t)buf, .len = PS, .mode = m.t == DATA_S ? UFFDIO_COPY_MODE_WP : 0};
       if (ioctl(uffd, UFFDIO_COPY, &c)) setwp(pg, m.t == DATA_S); st[pg] = m.t == DATA_S ? 1 : 2; if (!pending[pg]) nunsol++; }
     else if (m.t == DATA_REP) { struct uffdio_copy c = {.dst = (uintptr_t)base + pg * PS, .src = (uintptr_t)buf, .len = PS, .mode = 0}; if (ioctl(uffd, UFFDIO_COPY, &c)) { setwp(pg, 0); memcpy(base + pg * PS, buf, PS); } addrep(pg, buf); st[pg] = 3; }
     else if (m.t == GRANT_M) { setwp(pg, 0); st[pg] = 2; if (!pending[pg]) nunsol++; }
-    else if (m.t == RECALL) { relflush(); if (repidx[pg]) droprep(pg); setwp(pg, 1); if (st[pg] == 2) { pthread_mutex_lock(&gmu); if (nghost < maxghost) { ghost_pg[nghost] = pg; memcpy(ghost_data + (size_t)nghost * PS, base + pg * PS, PS); nghost++; } pthread_mutex_unlock(&gmu); } st[pg] = 1; struct msg r = {.t = ACK, .has_data = 1, .pg = pg}; sendm(&r, base + pg * PS); nrecall_c++; continue; }
+    else if (m.t == RECALL) { relflush(); if (repidx[pg]) droprep(pg); setwp(pg, 1); int gh = st[pg] == 2 && ghost_add(pg); st[pg] = 1; struct msg r = {.t = ACK, .has_data = 1, .from = gh ? GHOSTF : 0, .pg = pg}; sendm(&r, base + pg * PS); nrecall_c++; continue; }
     else if (m.t == INVQ) { if (repidx[pg]) droprep(pg); setwp(pg, 1); st[pg] = 0; fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pg * PS, PS); ninv_c++; continue; }
-    else if (m.t == INV) { relflush(); if (repidx[pg]) droprep(pg); setwp(pg, 1); int had = st[pg] == 2; st[pg] = 0;
-      if (had) { pthread_mutex_lock(&gmu); if (nghost < maxghost) { ghost_pg[nghost] = pg; memcpy(ghost_data + (size_t)nghost * PS, base + pg * PS, PS); nghost++; } pthread_mutex_unlock(&gmu); }
-      struct msg r = {.t = ACK, .has_data = 1, .pg = pg}; sendm(&r, base + pg * PS); fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pg * PS, PS); ninv_c++; continue; }
+    else if (m.t == INV) { relflush(); if (repidx[pg]) droprep(pg); setwp(pg, 1); int had = st[pg] == 2, was = st[pg]; st[pg] = 0;
+      int gh = had && ghost_add(pg);
+      /* VEIL_DSM_CLEANACK: a write-protected shared copy is identical to the home's, so its invalidation ack carries no page
+         (1 = no data, 2 = audit: still send it, marked, and the home counts any difference as clean_mismatch) */
+      if (!had && was == 1 && cleanack == 1) { struct msg r = {.t = ACK, .has_data = 0, .from = 0x5A, .pg = pg}; sendm(&r, 0); nclean++; }
+      else { struct msg r = {.t = ACK, .has_data = 1, .from = gh ? GHOSTF : (!had && was == 1 && cleanack == 2) ? 0x5A : 0, .pg = pg}; sendm(&r, base + pg * PS); }
+      fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, pg * PS, PS); ninv_c++; continue; }
     pthread_mutex_lock(&mu); pending[pg] = 0; if (fault_t0[pg] > 0) { stall_sum += now() - fault_t0[pg]; nstall++; fault_t0[pg] = 0; } pthread_mutex_unlock(&mu); wake(pg); }
 }
 static void *faulter(void *a) {
   double last = now(), lastwd = now(), wd = getenv("VEIL_DSM_FAILOVER_S") ? atof(getenv("VEIL_DSM_FAILOVER_S")) : 5;
   for (;;) { struct pollfd p = {uffd, POLLIN, 0}; int r = poll(&p, 1, 500);
-    if (now() - last > 10) { last = now(); fprintf(stderr, "DSM node%d faults read=%lu write=%lu wp_upgrade=%lu replies=%lu unsolicited=%lu zero=%lu recalls=%lu invs=%lu replicated=%u diffs_out=%lu upd_in=%lu seq_err=%lu failovers=%lu stall_avg_us=%.1f fences=%lu fence_timeouts=%lu rep_drop=%lu rep_skip=%lu upd_drop=%lu relflush=%lu sw_install=%lu sw_fail=%lu batches_out=%lu batches_in=%lu\n", myid, nfault_r, nfault_w, nfault_wp, nrecv, nunsol, nzero_c, nrecall_c, ninv_c, nrepl, ndiff_out, nupd_in, seqerr_c, nfailover, nstall ? stall_sum / nstall * 1e6 : 0, nfence, nfence_to, nrepdrop, nrepskip, nupd_drop, nrelflush, nswin, nswfail, nbatch_out, nbatch_in); }
+    if (now() - last > 10) { last = now(); fprintf(stderr, "DSM node%d faults read=%lu write=%lu wp_upgrade=%lu replies=%lu unsolicited=%lu zero=%lu recalls=%lu invs=%lu replicated=%u diffs_out=%lu upd_in=%lu seq_err=%lu failovers=%lu stall_avg_us=%.1f fences=%lu fence_timeouts=%lu rep_drop=%lu rep_skip=%lu upd_drop=%lu relflush=%lu sw_install=%lu sw_fail=%lu batches_out=%lu batches_in=%lu clean_acks=%lu unmirrored_now=%d unmirrored_overflow=%lu\n", myid, nfault_r, nfault_w, nfault_wp, nrecv, nunsol, nzero_c, nrecall_c, ninv_c, nrepl, ndiff_out, nupd_in, seqerr_c, nfailover, nstall ? stall_sum / nstall * 1e6 : 0, nfence, nfence_to, nrepdrop, nrepskip, nupd_drop, nrelflush, nswin, nswfail, nbatch_out, nbatch_in, nclean, nghost, nghost_full); }
     { static double lst; if (now() - lst > 10) { lst = now(); double tn = now(); int ns = 0; for (size_t i = 0; i < np; i++) if (fault_t0[i] > 0 && tn - fault_t0[i] > 2) { if (ns++ < 4) fprintf(stderr, "DSM node%d STALL pg=%zx age=%.1fs pending=%d st=%d\n", myid, i, tn - fault_t0[i], pending[i], st[i]); } if (ns) fprintf(stderr, "DSM node%d STALL total=%d\n", myid, ns); } }
     /* liveness with a standby: a node served from its own replicas may send nothing for long; ping the home every
        second of silence and declare it dead after FAILOVER_S without any message (a silently dead home sends no RST) */
@@ -223,7 +240,7 @@ static void attach(void *p, size_t len, int fd, const char *tgt) {
   if (!hp) { fprintf(stderr, "DSM: VEIL_DSM_HOME missing\n"); return; }
   for (int i = 0; (sock = dial(hp)) < 0; i++) { if (i > 600) { perror("DSM connect"); exit(1); } usleep(500000); }
   uint16_t id16 = myid; xfer(sock, &id16, 2, 1);
-  base = p; np = len / PS; memfd = dup(fd); pending = calloc(np, 1); st = calloc(np, 1); repidx = calloc(np, 4); fault_t0 = calloc(np, sizeof(double)); ghost_pg = calloc(maxghost, 4); ghost_data = malloc((size_t)maxghost * PS);
+  base = p; np = len / PS; memfd = dup(fd); pending = calloc(np, 1); st = calloc(np, 1); repidx = calloc(np, 4); fault_t0 = calloc(np, sizeof(double)); ghost_pg = calloc(maxghost, 4); ghost_seq = calloc(maxghost, 4); ghost_data = malloc((size_t)maxghost * PS);
   fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, len);  /* start empty: every page comes from the directory */
   uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK); struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_MISSING_SHMEM | UFFD_FEATURE_WP_HUGETLBFS_SHMEM};
   struct uffdio_register reg = {.range = {(uintptr_t)p, len}, .mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP};
@@ -232,6 +249,7 @@ static void attach(void *p, size_t len, int fd, const char *tgt) {
     size_t ch = 2u << 20; char *z = aligned_alloc(PS, ch); memset(z, 0, ch); double t0 = now();
     for (size_t o = 0; o < len; o += ch) { struct uffdio_copy c = {.dst = (uintptr_t)p + o, .src = (uintptr_t)z, .len = len - o < ch ? len - o : ch, .mode = UFFDIO_COPY_MODE_WP}; if (ioctl(uffd, UFFDIO_COPY, &c)) { perror("DSM prefill"); break; } }
     memset(st, 1, np); fprintf(stderr, "DSM node%d prefilled %zu MiB as shared-zero in %.3fs\n", myid, len >> 20, now() - t0); free(z); }
+  cleanack = getenv("VEIL_DSM_CLEANACK") ? atoi(getenv("VEIL_DSM_CLEANACK")) : 0;
   fence_grants = getenv("VEIL_DSM_FENCE") && atoi(getenv("VEIL_DSM_FENCE")) >= 2;
   pthread_t t1, t2, t3; pthread_create(&t1, 0, receiver, 0); pthread_create(&t2, 0, faulter, 0); pthread_create(&t3, 0, syncer, 0);
   fprintf(stderr, "DSM node%d attached %s len=%zu MiB pages=%zu home=%s standby=%s\n", myid, tgt, len >> 20, np, hp, getenv("VEIL_DSM_HOME2") ? getenv("VEIL_DSM_HOME2") : "-");
