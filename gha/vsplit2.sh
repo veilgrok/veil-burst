@@ -10,11 +10,13 @@ set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|
 case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
-  K put vs-$RUN-reg-$G "$REG|$V"; ALL=$(K wait vs-$RUN-reg- $NN $([ $KN -gt 2 ] && echo 900 || echo 300)) || ALL=$(K wait vs-$RUN-reg- $KN 5)
+  K put vs-$RUN-reg-$G "$REG|$V|$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')"; ALL=$(K wait vs-$RUN-reg- $NN $([ $KN -gt 2 ] && echo 900 || echo 300)) || ALL=$(K wait vs-$RUN-reg- $KN 5)
   SEL=$(echo "$ALL" | VENDOR=${VENDOR:-} MODE=$MODE KN=$KN python3 -c "
-import json,sys,os; kn=int(os.environ['KN']); d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; g={}
-for i in sorted(d): g.setdefault(d[i],[]).append(i)
-c=[v for k,v in g.items() if len(v)>=kn and k.endswith('|intel')] or ([] if os.environ.get('VENDOR')=='intel' else [v for v in g.values() if len(v)>=kn])
+import json,sys,os; kn=int(os.environ['KN']); d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; c=[]
+for full in (1,0):  # same region+vendor+model first (same TSC rate), then same region+vendor
+  g={}
+  for i in sorted(d): g.setdefault(d[i] if full else '|'.join(d[i].split('|')[:2]),[]).append(i)
+  c=c or [v for k,v in g.items() if len(v)>=kn and '|intel' in k] or ([] if os.environ.get('VENDOR')=='intel' else [v for v in g.values() if len(v)>=kn])
 r=c[0][:kn] if c else None
 if not r and kn==4 and os.environ.get('MODE')=='R':
   pr=[v for k,v in g.items() if len(v)>=2]
