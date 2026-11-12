@@ -6,7 +6,7 @@
 #               X2  2 runners x 1 vCPU (home on node0)                 X4  2 runners x 2 vCPU
 #               X3  3 runners x 1 vCPU                                 R   3 runners (see below)
 #   R: 3 runners: node0 BSP + mirror home, node1 AP, node2 primary home (killed at KILLAT)
-set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*|REPMIN=*|REPSILENT=*|FENCE=*|VENDOR=*|TSC=*|TSCKHZ=*|SAMEMODEL=*|PROF_S=*|SW=*|TMIG=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
+set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*|REPMIN=*|REPSILENT=*|FENCE=*|VENDOR=*|TSC=*|TSCKHZ=*|SAMEMODEL=*|PROF_S=*|SW=*|TMIG=*|CLEANACK=*|MSYNC=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
 case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
@@ -70,8 +70,8 @@ PY
 KI=gha/bin/bz-4.18.20-hz100-nohzfull
 GA="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((SMP-1)) rcu_nocbs=1-$((SMP-1))$([ "${TMIG:-0}" = 0 ] && echo " veiltmig0")"
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $SMP -m 512 -kernel /w/$KI -initrd /w/l3x.gz -nographic -no-reboot -net none"
-E="VEIL_DSM_SW=${SW:-0} VEIL_DSM_PROF_S=${PROF_S:-1} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
-SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_TSC_SYNC=${TSC:-1} VEIL_TSC_KHZ=${TSCKHZ:-2000000} VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
+E="${MSYNC:+VEIL_DSM_MSYNC=1 }VEIL_DSM_SW=${SW:-0} VEIL_DSM_PROF_S=${PROF_S:-1} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
+SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_CLEANACK=${CLEANACK:-0} VEIL_TSC_SYNC=${TSC:-1} VEIL_TSC_KHZ=${TSCKHZ:-2000000} VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
 baselines() {  # same-runner single-process references: stock QEMU (in-kernel irqchip, memfd RAM) and one QEMU-gvm process with all vCPUs, no DSM
   for s in "$@"; do T0=$(date +%s.%N); timeout -s KILL 200 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu host -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd; sleep 5  # let the stamp PB_DONE pkill fire before the next VM
     GAs="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((s-1)) rcu_nocbs=1-$((s-1))"
