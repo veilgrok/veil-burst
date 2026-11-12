@@ -79,7 +79,7 @@ static int failover(void) {
   int nre = 0; for (size_t pg = 0; pg < np; pg++) if (pending[pg]) { struct msg q = {.t = pending[pg], .from = myid, .pg = pg}; sendm_locked(&q, 0, 0); nre++; }
   pthread_mutex_unlock(&smu); nfailover++;
   fprintf(stderr, "DSM node%d: FAILOVER done in %.3fs (states=%u unmirrored_wb=%u replicated=%u reissued=%d)\n", myid, now() - t0, n, ng, nr, nre); return 0; }
-static unsigned long nswin, nswfail, nbatch_out, nbatch_in;
+static unsigned long nswin, nswfail, nbatch_out, nbatch_in, nping; static volatile double last_rx;
 /* single-writer replica update: the guest sees either the whole old page or the whole new one (seqcount-safe):
    the page is read-only here (WP), so copy it, merge the writer's bits, punch it out (vCPU reads now block in uffd), install */
 static void swinstall(uint64_t pg, const uint64_t *nw, const uint64_t *mk, char *ib) {
@@ -92,7 +92,7 @@ static void relflush(void);
 static void *receiver(void *a) {
   char *buf = aligned_alloc(PS, PS + BM), *ib = aligned_alloc(PS, PS);
   for (;;) { struct msg m; if (xfer(sock, &m, sizeof m, 0)) { if (failover() == 0) continue; fprintf(stderr, "DSM recv: home closed\n"); return 0; }
-    if (m.seq != rseq) seqerr_c++; rseq = m.seq + 1; uint64_t pg = m.pg; nrecv++;
+    if (m.seq != rseq) seqerr_c++; rseq = m.seq + 1; uint64_t pg = m.pg; nrecv++; last_rx = now();
     if (nghost) { pthread_mutex_lock(&gmu); nghost = 0; pthread_mutex_unlock(&gmu); }
     if (m.t == FENCE && (m.pg >> 62)) { struct msg r = {.t = ACK, .from = myid, .pg = m.pg}; pthread_mutex_lock(&smu); sendm_locked(&r, 0, 0); pthread_mutex_unlock(&smu); continue; }
     if (m.t == FENCE) { pthread_mutex_lock(&fmu); fdone = m.pg; pthread_cond_broadcast(&fcv); pthread_mutex_unlock(&fmu); continue; }
@@ -150,6 +150,11 @@ static void *faulter(void *a) {
   for (;;) { struct pollfd p = {uffd, POLLIN, 0}; int r = poll(&p, 1, 500);
     if (now() - last > 10) { last = now(); fprintf(stderr, "DSM node%d faults read=%lu write=%lu wp_upgrade=%lu replies=%lu unsolicited=%lu zero=%lu recalls=%lu invs=%lu replicated=%u diffs_out=%lu upd_in=%lu seq_err=%lu failovers=%lu stall_avg_us=%.1f fences=%lu fence_timeouts=%lu rep_drop=%lu rep_skip=%lu upd_drop=%lu relflush=%lu sw_install=%lu sw_fail=%lu batches_out=%lu batches_in=%lu\n", myid, nfault_r, nfault_w, nfault_wp, nrecv, nunsol, nzero_c, nrecall_c, ninv_c, nrepl, ndiff_out, nupd_in, seqerr_c, nfailover, nstall ? stall_sum / nstall * 1e6 : 0, nfence, nfence_to, nrepdrop, nrepskip, nupd_drop, nrelflush, nswin, nswfail, nbatch_out, nbatch_in); }
     { static double lst; if (now() - lst > 10) { lst = now(); double tn = now(); int ns = 0; for (size_t i = 0; i < np; i++) if (fault_t0[i] > 0 && tn - fault_t0[i] > 2) { if (ns++ < 4) fprintf(stderr, "DSM node%d STALL pg=%zx age=%.1fs pending=%d st=%d\n", myid, i, tn - fault_t0[i], pending[i], st[i]); } if (ns) fprintf(stderr, "DSM node%d STALL total=%d\n", myid, ns); } }
+    /* liveness with a standby: a node served from its own replicas may send nothing for long; ping the home every
+       second of silence and declare it dead after FAILOVER_S without any message (a silently dead home sends no RST) */
+    if (getenv("VEIL_DSM_HOME2") && sock >= 0 && last_rx > 0) { double tn = now(); static double lp;
+      if (tn - last_rx > 1 && tn - lp > 1) { lp = tn; pthread_mutex_lock(&fmu); uint64_t g = ++fgen; pthread_mutex_unlock(&fmu); struct msg q = {.t = FENCE, .from = myid, .pg = g}; pthread_mutex_lock(&smu); if (sock >= 0) sendm_locked(&q, 0, 0); pthread_mutex_unlock(&smu); nping++; }
+      if (tn - last_rx > wd) { fprintf(stderr, "DSM node%d: home silent %.1fs -> declaring home dead\n", myid, tn - last_rx); last_rx = tn + 30; shutdown(sock, SHUT_RDWR); } }
     if (getenv("VEIL_DSM_HOME2") && now() - lastwd > 1) { lastwd = now(); double tn = now(); for (size_t i = 0; i < np; i++) if (fault_t0[i] > 0 && tn - fault_t0[i] > wd) { fprintf(stderr, "DSM node%d: request for page %zx unanswered %.1fs -> declaring home dead\n", myid, i, tn - fault_t0[i]); shutdown(sock, SHUT_RDWR); for (size_t j = 0; j < np; j++) if (fault_t0[j] > 0) fault_t0[j] = tn + 30; break; } }
     if (r <= 0) continue; struct uffd_msg m; if (read(uffd, &m, sizeof m) != sizeof m || m.event != UFFD_EVENT_PAGEFAULT) continue;
     uint64_t pg = (m.arg.pagefault.address - (uintptr_t)base) / PS; int wp = m.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP, w = wp || (m.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WRITE);
