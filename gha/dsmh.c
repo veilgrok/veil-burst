@@ -53,6 +53,7 @@ static void dodiff(int src, uint64_t pg) {  /* tmp = page + bitmap */
   wrt[pg] = 1; ndiff++; mput(pg); for (int x = 0; x < NC; x++) if (x != src && cs[x] >= 0) sendc(x, UPD, pg, 2, tmp, PS + BM);
   if (rep[pg] == 1 && !looks_pt(mem + pg * PS) && ndq < 4096) { rep[pg] = 2; dq[ndq++] = pg; } }  /* reused as data (freed page table): back to single-writer */
 static unsigned long nfen;
+static uint32_t *pcnt; static uint8_t *pmask; static unsigned long pt_req[8][2]; static double prof_s;
 static void waitack(int x, uint64_t pg) {
   if (dly && x == 1) usleep(dly);  /* VEIL_DSM_DELAY_US: emulate the cross-runner link to client 1 on one host */
   for (;;) { struct msg r; if (recvc(x, &r)) fatal_client(x);
@@ -85,6 +86,7 @@ static void do_wr(int c, uint64_t pg) {
   if (n > 1) { cork(c, 0); nwa += n - 1; } }
 static void handle(int c, struct msg *m) {
   if (m->t != RD && m->t != WR) return; if (dly && c == 1) usleep(dly); uint64_t pg = m->pg; if (pg >= np) { fprintf(stderr, "bad page %llx\n", (unsigned long long)pg); return; } nreq++;
+  if (pcnt) { pcnt[pg]++; pmask[pg] |= (m->t == WR ? 0x10 : 0x01) << (c & 3); pt_req[c & 7][m->t == WR]++; }
   if (rep[pg]) { sendc(c, DATA_REP, pg, 1, mem + pg * PS, PS); sh[pg] |= 1 << c; return; }
   int others = (owner[pg] >= 0 && owner[pg] != c) || (sh[pg] & ~(1 << c));
   if (repmin && others && same[pg] >= repmin && (looks_pt(mem + pg * PS) || (repsilent && same[pg] >= repsilent))) {
@@ -113,9 +115,14 @@ static void accept_client(int ls) {  /* handshake: u16 id (bit15 = resume after 
 static void init(size_t n, int nc) { np = n; NC = nc; mem = calloc(np, PS); wrt = calloc(np, 1); sh = calloc(np, 1); rep = calloc(np, 1); owner = malloc(np); memset(owner, -1, np); same = calloc(np, 2); hot = calloc(np, 4); lbm = calloc(np, sizeof *lbm); lsrc = calloc(np, 1); ltime = calloc(np, sizeof(double)); gt = calloc(np, sizeof(double)); gown = malloc(np); memset(gown, -1, np); if (getenv("VEIL_DSM_HOTWIN_MS")) hotwin = atof(getenv("VEIL_DSM_HOTWIN_MS")) / 1e3;
   for (int i = 0; i < MAXC; i++) cs[i] = -1; t_start = now(); invq = getenv("VEIL_DSM_INVQ") && atoi(getenv("VEIL_DSM_INVQ"));
   repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; repsilent = getenv("VEIL_DSM_REPSILENT") ? atoi(getenv("VEIL_DSM_REPSILENT")) : 0; dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; ramax = getenv("VEIL_DSM_RA") ? atoi(getenv("VEIL_DSM_RA")) : 0; if (ramax > MAXB) ramax = MAXB; }
+static void prof(void) {  /* VEIL_DSM_PROF_S: per-interval request counts per client and the hottest pages (mask: low nibble = readers, high = writers, bit = client) */
+  fprintf(stderr, "DSM prof t=%.1f", now() - t_start); for (int c = 0; c < NC; c++) fprintf(stderr, " c%d=rd%lu/wr%lu", c, pt_req[c][0], pt_req[c][1]); memset(pt_req, 0, sizeof pt_req); fprintf(stderr, " top:");
+  for (int k = 0; k < 12; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (pcnt[i] > pcnt[bi]) bi = i; if (!pcnt[bi]) break; fprintf(stderr, " %zx:%u:%02x%s", bi, pcnt[bi], pmask[bi], rep[bi] ? "R" : ""); pcnt[bi] = 0; }
+  fprintf(stderr, "\n"); memset(pcnt, 0, np * 4); memset(pmask, 0, np); }
 static int serve(int ls) {
-  double tl = now(); int rr = 0;
+  double tl = now(), tp = now(); int rr = 0; prof_s = getenv("VEIL_DSM_PROF_S") ? atof(getenv("VEIL_DSM_PROF_S")) : 0; if (prof_s > 0) { pcnt = calloc(np, 4); pmask = calloc(np, 1); }
   for (;;) {
+    if (pcnt && now() - tp > prof_s) { tp = now(); prof(); }
     if (now() - tl > 10) { tl = now(); stats(); }
     struct q cur;
     if (npend) { cur = pend[0]; memmove(pend, pend + 1, --npend * sizeof *pend); }

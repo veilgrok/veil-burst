@@ -68,11 +68,15 @@ PY
 KI=gha/bin/bz-4.18.20-hz100-nohzfull
 GA="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((SMP-1)) rcu_nocbs=1-$((SMP-1))"
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $SMP -m 512 -kernel /w/$KI -initrd /w/l3x.gz -nographic -no-reboot -net none"
-E="VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
+E="VEIL_DSM_PROF_S=${PROF_S:-1} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
 SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
+baselines() {  # same-runner single-process references: stock QEMU (in-kernel irqchip, memfd RAM) and one QEMU-gvm process with all vCPUs, no DSM
+  for s in "$@"; do T0=$(date +%s.%N); timeout -s KILL 200 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu host -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd
+    GAs="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((s-1)) rcu_nocbs=1-$((s-1))"
+    T0=$(date +%s.%N); timeout -s KILL 200 chroot /l2r /opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $s -m 512 -kernel /w/$KI -initrd /w/l3x.gz -append "$GAs" -nographic -no-reboot -net none -local-cpu $s,start=0,iplist="127.0.0.1" 2>&1 | stamp G${s}_single; done; }
 if [ "$MODE" = B2 ]; then
   for i in 1 2; do t0=$(date +%s.%N); ./pbench 1 10000000 >/dev/null; t1=$(date +%s.%N); ./pbench 2 10000000 >/dev/null; t2=$(date +%s.%N); ./pbench 4 10000000 >/dev/null; t3=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))") pb4_wall_s=$(python3 -c "print(round($t3-$t2,3))")"; done
-  for s in 2 4; do T0=$(date +%s.%N); timeout -s KILL 240 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu kvm64 -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd; done
+  baselines 2 4
   exit 0; fi
 if [ "$MODE" = S3 ]; then rm -f /dev/shm/veil*; T0=$(date +%s.%N)
   env $E timeout -s KILL 900 ./dsmh home 7910 131072 2 2> home.log &
@@ -102,7 +106,7 @@ if [ $G = $HOMEN ]; then
 fi
 if [ $G -lt $NCOMP ]; then K wait vs-$RUN-home- 1 600 >/dev/null; LC=$((SMP/NCOMP)); ST=$((G*LC))
   if [ $G = 0 ]; then (WATCHT="150 300 600" watch_mon 4444 &); timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu $LC,start=0,iplist="$IPL" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $MODE
-    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f mirror.log ] && { grep -aE "TAKEOVER|takeover|resum|LOST|lost|refused" mirror.log | head -8 | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; }; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done
+    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f home.log ] && grep -a "DSM prof" home.log | awk '$4!="c0=rd0/wr0"||1' | cut -c1-420 | while IFS= read -r x; do L "[prof] $x"; done; [ -f mirror.log ] && { grep -aE "TAKEOVER|takeover|resum|LOST|lost|refused" mirror.log | head -8 | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; }; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done; baselines $SMP
   else timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=$G $GQ -shm-path veilB -append "$GA" -local-cpu $LC,start=$ST,iplist="$IPL" -monitor tcp:127.0.0.1:4445,server,nowait > ap.log 2>&1 & QP=$!; (WATCHT="150 300 600" watch_mon 4445 &)
     (while sleep 30; do grep -a "DSM node$G" ap.log | tail -3 | while IFS= read -r x; do L "[ap$G] $x"; done; done &); K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 3; kill -9 $QP 2>/dev/null
     grep -aE "DSM node$G|FAILOVER|lost" ap.log | tail -4 | while IFS= read -r x; do L "[ap$G-final] $x"; done; fi
