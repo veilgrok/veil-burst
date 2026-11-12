@@ -68,8 +68,8 @@ PY
 KI=gha/bin/bz-4.18.20-hz100-nohzfull
 GA="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((SMP-1)) rcu_nocbs=1-$((SMP-1))"
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $SMP -m 512 -kernel /w/$KI -initrd /w/l3x.gz -nographic -no-reboot -net none"
-E="VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-2048} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
-SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-0}"
+E="VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
+SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
 if [ "$MODE" = B2 ]; then
   for i in 1 2; do t0=$(date +%s.%N); ./pbench 1 10000000 >/dev/null; t1=$(date +%s.%N); ./pbench 2 10000000 >/dev/null; t2=$(date +%s.%N); ./pbench 4 10000000 >/dev/null; t3=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))") pb4_wall_s=$(python3 -c "print(round($t3-$t2,3))")"; done
   for s in 2 4; do T0=$(date +%s.%N); timeout -s KILL 240 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu kvm64 -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd; done
