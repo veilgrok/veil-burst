@@ -28,7 +28,7 @@ print(' '.join(map(str,r)) if r else 'none')")
   P=-1; i=0; for s in $SEL; do [ "$s" = "$G" ] && P=$i; i=$((i+1)); done; [ $P -lt 0 ] && { echo "not picked"; exit 0; }; G=$P
 fi
 L() { echo "$*"; (K put vs-$RUN-log-$G-$(date +%s%N) "$*" >/dev/null 2>&1 &) ; }
-L "NODE eptad=$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na) knobs='${MODES#$MODE}' mode=$MODE cpu=$(lscpu | sed -n 's/Model name: *//p' | head -1) region=$REG"
+L "NODE eptad=$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na) npt=$(cat /sys/module/kvm_amd/parameters/npt 2>/dev/null || echo na) knobs='${MODES#$MODE}' mode=$MODE cpu=$(lscpu | sed -n 's/Model name: *//p' | head -1) region=$REG"
 gcc -O2 -o dsmh gha/dsmh.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -static -pthread -o xcheck gha/xcheck.c && gcc -O2 -static -pthread -o pbench gha/pbench.c && gcc -O2 -static -pthread -o torture gha/torture.c || { L "build failed"; exit 1; }
 mkdir -p /l2r && tar -xzf art/l2root.tar.gz -C /l2r && mkdir -p /l2r/w && mount --bind $PWD /l2r/w && mount --rbind /dev /l2r/dev && mount -t proc p /l2r/proc || { echo chroot setup failed; exit 1; }
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp /l2r/bin/busybox pbench memtouch xcheck torture l3/bin/; for c in sh cat grep nproc poweroff mount head tr; do ln -sf busybox l3/bin/$c; done
