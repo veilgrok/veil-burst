@@ -71,11 +71,12 @@ static int failover(void) {
   pthread_mutex_lock(&smu); close(sock); sock = -1; fprintf(stderr, "DSM node%d: home lost, failing over to %s\n", myid, h2);
   for (int i = 0; i < 240 && sock < 0; i++) { sock = dial(i & 1 ? h1 : h2); if (sock < 0) usleep(500000); }
   if (sock < 0) { pthread_mutex_unlock(&smu); fprintf(stderr, "DSM node%d: no home reachable -> giving up\n", myid); return -1; }
+  { int nd = 0; for (size_t i = 0; i < np; i++) if (st[i] == 4) { st[i] = 0; fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, i * PS, PS); nd++; } if (nd) fprintf(stderr, "DSM node%d: dropped %d single-writer replicas for refetch\n", myid, nd); }
   sseq = rseq = 0; uint16_t id16 = myid | 0x8000; xfer(sock, &id16, 2, 1);
   uint32_t n = 0; for (size_t i = 0; i < np; i++) n += st[i] != 0; xfer(sock, &n, 4, 1);
   char *eb = malloc(5 * (size_t)n + 1), *e = eb; for (uint32_t i = 0; i < np; i++) if (st[i]) { memcpy(e, &i, 4); e[4] = st[i] == 4 ? 1 : st[i]; e += 5; } xfer(sock, eb, e - eb, 1); free(eb);
   pthread_mutex_lock(&gmu); uint32_t ng = nghost; xfer(sock, &ng, 4, 1); for (int i = 0; i < nghost; i++) { xfer(sock, &ghost_pg[i], 4, 1); xfer(sock, ghost_data + (size_t)i * PS, PS, 1); } nghost = 0; pthread_mutex_unlock(&gmu);
-  uint32_t nr = 0; for (uint32_t i = 1; i <= nrepl; i++) nr += st[reppg[i]] == 3; xfer(sock, &nr, 4, 1); for (uint32_t i = 1; i <= nrepl; i++) if (st[reppg[i]] == 3) { uint32_t pg = reppg[i]; xfer(sock, &pg, 4, 1); xfer(sock, base + (size_t)pg * PS, PS, 1); }
+  uint32_t nr = nrepl; xfer(sock, &nr, 4, 1); for (uint32_t i = 1; i <= nrepl; i++) { uint32_t pg = reppg[i]; xfer(sock, &pg, 4, 1); xfer(sock, base + (size_t)pg * PS, PS, 1); }
   int nre = 0; for (size_t pg = 0; pg < np; pg++) if (pending[pg]) { struct msg q = {.t = pending[pg], .from = myid, .pg = pg}; sendm_locked(&q, 0, 0); nre++; }
   pthread_mutex_unlock(&smu); nfailover++;
   fprintf(stderr, "DSM node%d: FAILOVER done in %.3fs (states=%u unmirrored_wb=%u replicated=%u reissued=%d)\n", myid, now() - t0, n, ng, nr, nre); return 0; }
@@ -153,7 +154,7 @@ static void *faulter(void *a) {
     /* liveness with a standby: a node served from its own replicas may send nothing for long; ping the home every
        second of silence and declare it dead after FAILOVER_S without any message (a silently dead home sends no RST) */
     if (getenv("VEIL_DSM_HOME2") && sock >= 0 && last_rx > 0) { double tn = now(); static double lp;
-      if (tn - last_rx > 1 && tn - lp > 1) { lp = tn; pthread_mutex_lock(&fmu); uint64_t g = ++fgen; pthread_mutex_unlock(&fmu); struct msg q = {.t = FENCE, .from = myid, .pg = g}; pthread_mutex_lock(&smu); if (sock >= 0) sendm_locked(&q, 0, 0); pthread_mutex_unlock(&smu); nping++; }
+      if (tn - last_rx > 1 && tn - lp > 1) { lp = tn; pthread_mutex_lock(&fmu); uint64_t g = ++fgen; pthread_mutex_unlock(&fmu); struct msg q = {.t = FENCE, .from = myid, .pg = g}; if (!pthread_mutex_trylock(&smu)) { if (sock >= 0) sendm_locked(&q, 0, 0); pthread_mutex_unlock(&smu); nping++; } }
       if (tn - last_rx > wd) { fprintf(stderr, "DSM node%d: home silent %.1fs -> declaring home dead\n", myid, tn - last_rx); last_rx = tn + 30; shutdown(sock, SHUT_RDWR); } }
     if (getenv("VEIL_DSM_HOME2") && now() - lastwd > 1) { lastwd = now(); double tn = now(); for (size_t i = 0; i < np; i++) if (fault_t0[i] > 0 && tn - fault_t0[i] > wd) { fprintf(stderr, "DSM node%d: request for page %zx unanswered %.1fs -> declaring home dead\n", myid, i, tn - fault_t0[i]); shutdown(sock, SHUT_RDWR); for (size_t j = 0; j < np; j++) if (fault_t0[j] > 0) fault_t0[j] = tn + 30; break; } }
     if (r <= 0) continue; struct uffd_msg m; if (read(uffd, &m, sizeof m) != sizeof m || m.event != UFFD_EVENT_PAGEFAULT) continue;
