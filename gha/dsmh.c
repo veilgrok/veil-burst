@@ -22,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #define PS 4096
-#define BM 512
+#define BM 4096  /* per-word bit masks */
 #define MAXC 8
 #define MAXB 256
 enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT, UNREP, FENCE };
@@ -46,10 +46,10 @@ static int recvc(int c, struct msg *m) { if (xfer(cs[c], m, sizeof *m, 0)) retur
 static void cork(int c, int on) { setsockopt(cs[c], IPPROTO_TCP, TCP_CORK, &on, sizeof on); }
 static void mput(uint64_t pg) { if (mfd < 0) return; struct msg m = {.t = MPUT, .has_data = 1, .pg = pg}; char a; if (xfer(mfd, &m, sizeof m, 1) || xfer(mfd, mem + pg * PS, PS, 1) || xfer(mfd, &a, 1, 0)) { fprintf(stderr, "DSM home: mirror LOST (running unprotected)\n"); close(mfd); mfd = -1; return; } nmput++; }
 static void dodiff(int src, uint64_t pg) {  /* tmp = page + bitmap */
-  uint64_t *nw = (uint64_t *)tmp, *hm = (uint64_t *)(mem + pg * PS); uint8_t *bm = (uint8_t *)tmp + PS; double t = now();
-  if (lbm[pg] && lsrc[pg] != src && t - ltime[pg] < 0.003) for (int i = 0; i < BM; i++) if (lbm[pg][i] & bm[i]) { nconf++; break; }
+  uint64_t *nw = (uint64_t *)tmp, *hm = (uint64_t *)(mem + pg * PS); uint8_t *bm = (uint8_t *)tmp + PS; uint64_t *mk = (uint64_t *)bm; double t = now();
+  if (lbm[pg] && lsrc[pg] != src && t - ltime[pg] < 0.003) for (int i = 0; i < PS / 8; i++) if (((uint64_t *)lbm[pg])[i] & mk[i]) { nconf++; break; }
   if (!lbm[pg]) lbm[pg] = malloc(BM); memcpy(lbm[pg], bm, BM); lsrc[pg] = src; ltime[pg] = t;
-  for (int w = 0; w < PS / 8; w++) if (bm[w >> 3] >> (w & 7) & 1) { hm[w] = nw[w]; ndiffw++; }
+  for (int w = 0; w < PS / 8; w++) if (mk[w]) { hm[w] = (hm[w] & ~mk[w]) | (nw[w] & mk[w]); ndiffw++; }  /* bit-level 3-way merge: only the bits this node changed */
   wrt[pg] = 1; ndiff++; mput(pg); for (int x = 0; x < NC; x++) if (x != src && cs[x] >= 0) sendc(x, UPD, pg, 2, tmp, PS + BM);
   if (rep[pg] == 1 && !looks_pt(mem + pg * PS) && ndq < 4096) { rep[pg] = 2; dq[ndq++] = pg; } }  /* reused as data (freed page table): back to single-writer */
 static unsigned long nfen;

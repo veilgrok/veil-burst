@@ -42,7 +42,7 @@ struct uffdio_writeprotect { struct uffdio_range range; __u64 mode; };
 #endif
 #define PS 4096
 enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT_, UNREP, FENCE };
-#define BM 512
+#define BM 4096  /* diff payload: new words + per-word bit masks of what this node changed */
 #define MAXREP 8192
 static uint32_t nrepl, *repidx, reppg[MAXREP]; static uint64_t *twin[MAXREP]; static pthread_mutex_t rmu = PTHREAD_MUTEX_INITIALIZER; static volatile unsigned long ndiff_out, nupd_in;
 static void addrep(uint64_t pg, const void *content) { pthread_mutex_lock(&rmu); if (!repidx[pg] && nrepl < MAXREP - 1) { uint32_t i = ++nrepl; reppg[i] = pg; twin[i] = malloc(PS); memcpy(twin[i], content, PS); repidx[pg] = i; } pthread_mutex_unlock(&rmu); }
@@ -85,12 +85,12 @@ static void *receiver(void *a) {
     if (nghost) { pthread_mutex_lock(&gmu); nghost = 0; pthread_mutex_unlock(&gmu); }
     if (m.t == FENCE && (m.pg >> 62)) { struct msg r = {.t = ACK, .from = myid, .pg = m.pg}; pthread_mutex_lock(&smu); sendm_locked(&r, 0, 0); pthread_mutex_unlock(&smu); continue; }
     if (m.t == FENCE) { pthread_mutex_lock(&fmu); fdone = m.pg; pthread_cond_broadcast(&fcv); pthread_mutex_unlock(&fmu); continue; }
-    if (m.t == UPD) { if (xfer(sock, buf, PS + BM, 0)) continue; uint8_t *bm = (uint8_t *)buf + PS; uint64_t *nw = (uint64_t *)buf, *pw = (uint64_t *)(base + pg * PS); pthread_mutex_lock(&rmu); uint32_t i = repidx[pg];
-      if (i) for (int w = 0; w < PS / 8; w++) if (bm[w >> 3] >> (w & 7) & 1) { __atomic_store_n(&pw[w], nw[w], __ATOMIC_RELAXED); twin[i][w] = nw[w]; } if (!i) { nupd_drop++; if (nupd_drop < 6) fprintf(stderr, "DSM node%d UPD for non-replicated pg=%llx st=%d\n", myid, (unsigned long long)pg, st[pg]); } pthread_mutex_unlock(&rmu); nupd_in++; continue; }
+    if (m.t == UPD) { if (xfer(sock, buf, PS + BM, 0)) continue; uint64_t *mk = (uint64_t *)(buf + PS), *nw = (uint64_t *)buf, *pw = (uint64_t *)(base + pg * PS); pthread_mutex_lock(&rmu); uint32_t i = repidx[pg];
+      if (i) for (int w = 0; w < PS / 8; w++) if (mk[w]) { uint64_t o = __atomic_load_n(&pw[w], __ATOMIC_RELAXED), n; do n = (o & ~mk[w]) | (nw[w] & mk[w]); while (!__atomic_compare_exchange_n(&pw[w], &o, n, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)); twin[i][w] = (twin[i][w] & ~mk[w]) | (nw[w] & mk[w]); } if (!i) { nupd_drop++; if (nupd_drop < 6) fprintf(stderr, "DSM node%d UPD for non-replicated pg=%llx st=%d\n", myid, (unsigned long long)pg, st[pg]); } pthread_mutex_unlock(&rmu); nupd_in++; continue; }
     if (m.t == UNREP) {  /* stop writing, flush pending diff, leave the replicated set; an INVQ follows */
       pthread_mutex_lock(&rmu); setwp(pg, 1); uint32_t i = repidx[pg];
-      if (i) { uint64_t *pw = (uint64_t *)(base + pg * PS), *tw = twin[i], *ow = (uint64_t *)buf; uint8_t *bm = (uint8_t *)buf + PS; int any = 0; memset(bm, 0, BM);
-        for (int w = 0; w < PS / 8; w++) { uint64_t v = pw[w]; if (v != tw[w]) { ow[w] = v; tw[w] = v; bm[w >> 3] |= 1 << (w & 7); any = 1; } }
+      if (i) { uint64_t *pw = (uint64_t *)(base + pg * PS), *tw = twin[i], *ow = (uint64_t *)buf; uint64_t *mk = (uint64_t *)(buf + PS); int any = 0; memset(mk, 0, BM);
+        for (int w = 0; w < PS / 8; w++) { uint64_t v = pw[w]; if (v != tw[w]) { ow[w] = v; mk[w] = v ^ tw[w]; tw[w] = v; any = 1; } }
         if (any) { struct msg r = {.t = DIFF, .has_data = 2, .pg = pg}; pthread_mutex_lock(&smu); sendm_locked(&r, buf, PS + BM); pthread_mutex_unlock(&smu); ndiff_out++; }
         free(twin[i]); twin[i] = twin[nrepl]; reppg[i] = reppg[nrepl]; repidx[reppg[i]] = i; repidx[pg] = 0; nrepl--; }
       st[pg] = 1; pthread_mutex_unlock(&rmu); struct msg r = {.t = ACK, .pg = pg}; sendm(&r, 0); continue; }
@@ -123,9 +123,9 @@ static void *faulter(void *a) {
 }
 /* word-level diffs of replicated pages: shipped every VEIL_DSM_SYNC_US and synchronously before any interrupt leaves this node */
 static int sync_once(char *out) { int n = 0;
-    for (uint32_t i = 1; i <= nrepl; i++) { uint64_t *pw = (uint64_t *)(base + (uint64_t)reppg[i] * PS), *tw = twin[i], *ow = (uint64_t *)out; uint8_t *bm = (uint8_t *)out + PS; int any = 0;
+    for (uint32_t i = 1; i <= nrepl; i++) { uint64_t *pw = (uint64_t *)(base + (uint64_t)reppg[i] * PS), *tw = twin[i], *ow = (uint64_t *)out; uint64_t *mk = (uint64_t *)(out + PS); int any = 0;
       { unsigned char v = 0; if (mincore(pw, PS, &v) || !(v & 1)) { nrepskip++; continue; } }  /* never fault while holding rmu: the fault needs the receiver, which may wait for rmu */
-      for (int w = 0; w < PS / 8; w++) { uint64_t v = __atomic_load_n(&pw[w], __ATOMIC_RELAXED); if (v != tw[w]) { if (!any) { memset(bm, 0, BM); any = 1; } ow[w] = v; tw[w] = v; bm[w >> 3] |= 1 << (w & 7); } }
+      for (int w = 0; w < PS / 8; w++) { uint64_t v = __atomic_load_n(&pw[w], __ATOMIC_RELAXED); if (v != tw[w]) { if (!any) { memset(mk, 0, BM); any = 1; } ow[w] = v; mk[w] = v ^ tw[w]; tw[w] = v; } }
       if (any) { struct msg r = {.t = DIFF, .has_data = 2, .pg = reppg[i]}; pthread_mutex_lock(&smu); sendm_locked(&r, out, PS + BM); pthread_mutex_unlock(&smu); ndiff_out++; n++; } }
     return n; }
 static void *syncer(void *a) {

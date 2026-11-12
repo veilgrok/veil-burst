@@ -6,15 +6,15 @@
 #               X2  2 runners x 1 vCPU (home on node0)                 X4  2 runners x 2 vCPU
 #               X3  3 runners x 1 vCPU                                 R   3 runners (see below)
 #   R: 3 runners: node0 BSP + mirror home, node1 AP, node2 primary home (killed at KILLAT)
-set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
+set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*|REPMIN=*|REPSILENT=*|FENCE=*|VENDOR=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
 case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
   K put vs-$RUN-reg-$G "$REG|$V"; ALL=$(K wait vs-$RUN-reg- $NN $([ $KN -gt 2 ] && echo 900 || echo 300)) || ALL=$(K wait vs-$RUN-reg- $KN 5)
-  SEL=$(echo "$ALL" | MODE=$MODE KN=$KN python3 -c "
+  SEL=$(echo "$ALL" | VENDOR=${VENDOR:-} MODE=$MODE KN=$KN python3 -c "
 import json,sys,os; kn=int(os.environ['KN']); d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; g={}
 for i in sorted(d): g.setdefault(d[i],[]).append(i)
-c=[v for k,v in g.items() if len(v)>=kn and k.endswith('|intel')] or [v for v in g.values() if len(v)>=kn]
+c=[v for k,v in g.items() if len(v)>=kn and k.endswith('|intel')] or ([] if os.environ.get('VENDOR')=='intel' else [v for v in g.values() if len(v)>=kn])
 r=c[0][:kn] if c else None
 if not r and kn==4 and os.environ.get('MODE')=='R':
   pr=[v for k,v in g.items() if len(v)>=2]
@@ -26,7 +26,7 @@ print(' '.join(map(str,r)) if r else 'none')")
   P=-1; i=0; for s in $SEL; do [ "$s" = "$G" ] && P=$i; i=$((i+1)); done; [ $P -lt 0 ] && { echo "not picked"; exit 0; }; G=$P
 fi
 L() { echo "$*"; (K put vs-$RUN-log-$G-$(date +%s%N) "$*" >/dev/null 2>&1 &) ; }
-L "NODE mode=$MODE cpu=$(lscpu | sed -n 's/Model name: *//p' | head -1) region=$REG"
+L "NODE eptad=$(cat /sys/module/kvm_intel/parameters/eptad 2>/dev/null || echo na) knobs='${MODES#$MODE}' mode=$MODE cpu=$(lscpu | sed -n 's/Model name: *//p' | head -1) region=$REG"
 gcc -O2 -o dsmh gha/dsmh.c && gcc -O2 -static -o memtouch gha/memtouch.c && gcc -O2 -static -pthread -o xcheck gha/xcheck.c && gcc -O2 -static -pthread -o pbench gha/pbench.c && gcc -O2 -static -pthread -o torture gha/torture.c || { L "build failed"; exit 1; }
 mkdir -p /l2r && tar -xzf art/l2root.tar.gz -C /l2r && mkdir -p /l2r/w && mount --bind $PWD /l2r/w && mount --rbind /dev /l2r/dev && mount -t proc p /l2r/proc || { echo chroot setup failed; exit 1; }
 mkdir -p l3/bin l3/proc l3/sys l3/dev; cp /l2r/bin/busybox pbench memtouch xcheck torture l3/bin/; for c in sh cat grep nproc poweroff mount head tr; do ln -sf busybox l3/bin/$c; done
@@ -66,8 +66,8 @@ PY
 KI=gha/bin/bz-4.18.20-hz100-nohzfull
 GA="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((SMP-1)) rcu_nocbs=1-$((SMP-1))"
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $SMP -m 512 -kernel /w/$KI -initrd /w/l3x.gz -nographic -no-reboot -net none"
-E="VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=2048 VEIL_DSM_REPMIN=16 VEIL_DSM_PREFILL=1"
-SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil"
+E="VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-2048} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
+SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-0}"
 if [ "$MODE" = B2 ]; then
   for i in 1 2; do t0=$(date +%s.%N); ./pbench 1 10000000 >/dev/null; t1=$(date +%s.%N); ./pbench 2 10000000 >/dev/null; t2=$(date +%s.%N); ./pbench 4 10000000 >/dev/null; t3=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))") pb4_wall_s=$(python3 -c "print(round($t3-$t2,3))")"; done
   for s in 2 4; do T0=$(date +%s.%N); timeout -s KILL 240 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu kvm64 -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd; done
