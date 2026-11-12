@@ -88,7 +88,7 @@ static void handle(int c, struct msg *m) {
   if (rep[pg]) { sendc(c, DATA_REP, pg, 1, mem + pg * PS, PS); sh[pg] |= 1 << c; return; }
   int others = (owner[pg] >= 0 && owner[pg] != c) || (sh[pg] & ~(1 << c));
   if (repmin && others && same[pg] >= repmin && (looks_pt(mem + pg * PS) || (repsilent && same[pg] >= repsilent))) {
-    for (int x = 0; x < NC; x++) if (x != c && (owner[pg] == x || (sh[pg] >> x & 1))) { sendc(x, REPL, pg, 0, 0, 0); waitack(x, pg); }
+    for (int x = 0; x < NC; x++) if (x != c && (owner[pg] == x || (sh[pg] >> x & 1))) { sendc(x, REPL, pg, 0, 0, 0); waitack(x, pg); sh[pg] |= 1 << x; }  /* the former owner now holds a replica too: it must get UNREP on de-replication */
     rep[pg] = 1; nrep++; owner[pg] = -1; sh[pg] |= 1 << c; sendc(c, DATA_REP, pg, 1, mem + pg * PS, PS); return; }
   if (m->t == RD) do_rd(c, pg); else if (m->t == WR) do_wr(c, pg); }
 static void derep(uint64_t pg) {  /* every holder flushes its diff and drops write access, then all copies are invalidated */
