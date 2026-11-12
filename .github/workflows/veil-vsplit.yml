@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       relay_url: {required: true, type: string}
-      art_run: {required: true, type: string}
+      art_run: {required: false, default: "repo", type: string}
       n: {required: false, default: "[0,1,2,3,4,5]", type: string}
       modes: {required: false, default: "S1 S2 X", type: string}
       eptad: {required: false, default: "0", type: string}
@@ -15,7 +15,10 @@ jobs:
     timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - if: inputs.art_run == 'repo'
+        run: mkdir -p art && cp gha/bin/gvm/l2root.tar.gz gha/bin/gvm/bzImage art/
+      - if: inputs.art_run != 'repo'
+        uses: actions/download-artifact@v4
         with: {name: gvm, path: art, run-id: "${{ inputs.art_run }}", github-token: "${{ github.token }}"}
       - name: vcpu split
         env:
