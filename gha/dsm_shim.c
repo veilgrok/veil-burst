@@ -142,6 +142,21 @@ static void fence(void) {  /* release fence: every diff written before this inte
   struct msg q = {.t = FENCE, .from = myid, .pg = g}; pthread_mutex_lock(&smu); if (sock >= 0) sendm_locked(&q, 0, 0); pthread_mutex_unlock(&smu); nfence++;
   struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 50000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
   pthread_mutex_lock(&fmu); while (fdone < g) if (pthread_cond_timedwait(&fcv, &fmu, &ts)) { nfence_to++; break; } pthread_mutex_unlock(&fmu); }
+/* guest TSC sync across nodes: every node's QEMU writes guest IA32_TSC at vCPU reset; replace that value with a function of
+   the shared wall clock so all vCPUs (on different hosts/processes) see one TSC: guest_tsc = (CLOCK_REALTIME - epoch) * tsc_khz */
+static int (*real_ioctl)(int, unsigned long, ...); static unsigned long ntscfix;
+#include <stdarg.h>
+int ioctl(int fd, unsigned long req, ...) {
+  va_list ap; va_start(ap, req); void *arg = va_arg(ap, void *); va_end(ap); if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+  if (req == 0x4008ae89UL && arg && getenv("VEIL_TSC_SYNC") && atoi(getenv("VEIL_TSC_SYNC"))) {  /* KVM_SET_MSRS on a vCPU fd */
+    struct ent { uint32_t idx, res; uint64_t data; }; uint32_t n = *(uint32_t *)arg; struct ent *e = (struct ent *)((char *)arg + 8);
+    for (uint32_t i = 0; i < n && i < 512; i++) if (e[i].idx == 0x10) {
+      if (getenv("VEIL_TSC_KHZ") && atol(getenv("VEIL_TSC_KHZ")) > 0) { long want = atol(getenv("VEIL_TSC_KHZ")); int rc = real_ioctl(fd, 0xaea2UL, want);  /* KVM_SET_TSC_KHZ: same guest TSC rate on every host model */
+        if (ntscfix < 8) fprintf(stderr, "DSM tsc-khz set %ld rc=%d\n", want, rc); }
+      long khz = real_ioctl(fd, 0xaea3UL, 0);  /* KVM_GET_TSC_KHZ */
+      if (khz > 0) { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); __int128 ns = (__int128)t.tv_sec * 1000000000 + t.tv_nsec - (__int128)1780000000 * 1000000000;
+        uint64_t old = e[i].data; e[i].data = (uint64_t)(ns * khz / 1000000); if (ntscfix++ < 8) fprintf(stderr, "DSM tsc-sync vcpu_fd=%d khz=%ld old=%llu new=%llu\n", fd, khz, (unsigned long long)old, (unsigned long long)e[i].data); } } }
+  return real_ioctl(fd, req, arg); }
 static int8_t rtr[65536];
 static ssize_t (*real_sendmsg)(int, const struct msghdr *, int);
 ssize_t sendmsg(int fd, const struct msghdr *mh, int fl) {

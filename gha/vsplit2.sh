@@ -6,14 +6,14 @@
 #               X2  2 runners x 1 vCPU (home on node0)                 X4  2 runners x 2 vCPU
 #               X3  3 runners x 1 vCPU                                 R   3 runners (see below)
 #   R: 3 runners: node0 BSP + mirror home, node1 AP, node2 primary home (killed at KILLAT)
-set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*|REPMIN=*|REPSILENT=*|FENCE=*|VENDOR=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
+set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|KILLAT=*|XT=*|FOS=*|REPMIN=*|REPSILENT=*|FENCE=*|VENDOR=*|TSC=*|TSCKHZ=*|SAMEMODEL=*|PROF_S=*) export "$kv";; esac; done; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
 case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
   K put vs-$RUN-reg-$G "$REG|$V|$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')"; ALL=$(K wait vs-$RUN-reg- $NN 900) || ALL=$(K wait vs-$RUN-reg- $KN 5)
-  SEL=$(echo "$ALL" | VENDOR=${VENDOR:-} MODE=$MODE KN=$KN python3 -c "
+  SEL=$(echo "$ALL" | SAMEMODEL=${SAMEMODEL:-} VENDOR=${VENDOR:-} MODE=$MODE KN=$KN python3 -c "
 import json,sys,os; kn=int(os.environ['KN']); d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; c=[]
-for full in (1,0):  # same region+vendor+model first (same TSC rate), then same region+vendor
+for full in ((1,) if os.environ.get('SAMEMODEL') else (1,0)):  # same region+vendor+model first (same TSC rate), then same region+vendor
   g={}
   for i in sorted(d): g.setdefault(d[i] if full else '|'.join(d[i].split('|')[:2]),[]).append(i)
   c=c or [v for k,v in g.items() if len(v)>=kn and '|intel' in k] or ([] if os.environ.get('VENDOR')=='intel' else [v for v in g.values() if len(v)>=kn])
@@ -37,13 +37,14 @@ cat > l3/init <<'EOI'
 mount -t proc p /proc; mount -t sysfs s /sys; mount -t devtmpfs d /dev; exec >/dev/ttyS0 2>&1
 echo CPU_ON_START; for c in /sys/devices/system/cpu/cpu[1-9]*; do [ -e $c/online ] && echo 1 > $c/online; done; echo CPU_ON_DONE nproc=$(nproc)
 echo "L3 nproc=$(nproc) $(grep MemTotal /proc/meminfo | tr -s ' ') cs=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
-echo PB1_START; /bin/pbench 1 10000000
+D() { echo "DIAG $1 cs=$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource) $(grep -E 'LOC|RES|CAL' /proc/interrupts | tr -s ' ' | cut -d' ' -f2-4 | tr '\n' ' ') unstable=$(dmesg | grep -c unstable)"; }
+D boot; echo PB1_START; /bin/pbench 1 10000000
 echo PB2_START; /bin/pbench 2 10000000
 [ "$(nproc)" -ge 4 ] && { echo PB4_START; /bin/pbench 4 10000000; }
 echo MT_START; /bin/memtouch 128 3
 echo XC_START; /bin/xcheck 32
 echo TT_START; /bin/torture 3000 1500 500
-echo PB_DONE
+D end; echo PB_DONE
 poweroff -f
 EOI
 chmod +x l3/init; (cd l3 && find . | cpio -o -H newc 2>/dev/null | gzip > ../l3x.gz)
@@ -52,7 +53,7 @@ stamp() { n=$1; pm=""; pt=0; while IFS= read -r l; do now=$(date +%s.%N)
   case "$l" in *_START*|*PB_DONE*) [ -n "$pm" ] && L "PROF $n ${pm}_wall_s=$(python3 -c "print(round($now-$pt,3))")"; pm=$(echo "$l" | grep -o '[A-Z0-9]*_START' | head -1 | sed 's/_START//'); pt=$now
       case "$l" in *PB_DONE*) pm=""; (sleep 3; pkill -9 -f opt/gvm/qemu-system; pkill -9 -f "qemu-system-x86_64 -enable-kvm") & ;; esac;; esac
   case "$l" in *"$KILLAT"*) [ "$MODE" = R ] && { K put vs-$RUN-kill-0 1 >/dev/null; L "[$n] KILL requested at $KILLAT"; };; esac
-  case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*TORTURE*|*CPU_ON*|*"Command line"*|*rror*|*panic*|*DSM*|*lockup*|*rcu_sched*|*Stuck*|*"Run /init"*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
+  case "$l" in *L3*|*PBENCH*|*MEMTOUCH*|*XCHECK*|*TORTURE*|*CPU_ON*|*DIAG*|*tsc-*|*"Command line"*|*rror*|*panic*|*DSM*|*lockup*|*rcu_sched*|*Stuck*|*"Run /init"*) L "[$n] $(python3 -c "print(round($now-${T0:-$now},1))")s $l";; esac; done; }
 watch_mon() { for t in ${WATCHT:-120 300 600 900 1200}; do sleep $((t - ${pt:-0})); pt=$t; for p in "$@"; do python3 - $p <<'PY' 2>/dev/null | tr -d '\r' | grep -aE "CPU #" | sed "s/^/MON t=$t :$p /" | while IFS= read -r x; do L "$x"; done
 import socket,sys,time
 s=socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=3); time.sleep(0.3); s.sendall(b"info cpus\n"); time.sleep(0.7); s.settimeout(1); d=b""
@@ -69,11 +70,11 @@ KI=gha/bin/bz-4.18.20-hz100-nohzfull
 GA="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((SMP-1)) rcu_nocbs=1-$((SMP-1))"
 GQ="/opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $SMP -m 512 -kernel /w/$KI -initrd /w/l3x.gz -nographic -no-reboot -net none"
 E="VEIL_DSM_PROF_S=${PROF_S:-1} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPSILENT=${REPSILENT:-0} VEIL_DSM_REPMIN=${REPMIN:-16} VEIL_DSM_PREFILL=1"
-SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
+SH="LD_PRELOAD=/w/gha/bin/dsm_shim.so VEIL_TSC_SYNC=${TSC:-1} VEIL_TSC_KHZ=${TSCKHZ:-2000000} VEIL_DSM_PREFILL=1 VEIL_DSM_MATCH=veil VEIL_DSM_FENCE=${FENCE:-1}"
 baselines() {  # same-runner single-process references: stock QEMU (in-kernel irqchip, memfd RAM) and one QEMU-gvm process with all vCPUs, no DSM
-  for s in "$@"; do T0=$(date +%s.%N); timeout -s KILL 200 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu host -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd
+  for s in "$@"; do T0=$(date +%s.%N); timeout -s KILL 200 qemu-system-x86_64 -enable-kvm -smp $s -m 512 -cpu host -kernel $KI -initrd l3x.gz -append "console=ttyS0 panic=-1 nokaslr" -nographic -no-reboot -net none -object memory-backend-memfd,id=vram,size=512M,share=on -machine memory-backend=vram 2>&1 | stamp A${s}_memfd; sleep 5  # let the stamp PB_DONE pkill fire before the next VM
     GAs="console=ttyS0 panic=-1 no_timer_check noapic no-kvmclock nokaslr tsc=reliable lpj=24000000 maxcpus=1 nohz_full=1-$((s-1)) rcu_nocbs=1-$((s-1))"
-    T0=$(date +%s.%N); timeout -s KILL 200 chroot /l2r /opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $s -m 512 -kernel /w/$KI -initrd /w/l3x.gz -append "$GAs" -nographic -no-reboot -net none -local-cpu $s,start=0,iplist="127.0.0.1" 2>&1 | stamp G${s}_single; done; }
+    T0=$(date +%s.%N); timeout -s KILL 200 chroot /l2r /opt/gvm/qemu-system-x86_64 -L /opt/gvm -enable-kvm -machine pc,kernel-irqchip=off -smp $s -m 512 -kernel /w/$KI -initrd /w/l3x.gz -append "$GAs" -nographic -no-reboot -net none -local-cpu $s,start=0,iplist="127.0.0.1" 2>&1 | stamp G${s}_single; sleep 5; done; }
 if [ "$MODE" = B2 ]; then
   for i in 1 2; do t0=$(date +%s.%N); ./pbench 1 10000000 >/dev/null; t1=$(date +%s.%N); ./pbench 2 10000000 >/dev/null; t2=$(date +%s.%N); ./pbench 4 10000000 >/dev/null; t3=$(date +%s.%N); L "PROF L1bare pb1_wall_s=$(python3 -c "print(round($t1-$t0,3))") pb2_wall_s=$(python3 -c "print(round($t2-$t1,3))") pb4_wall_s=$(python3 -c "print(round($t3-$t2,3))")"; done
   baselines 2 4
@@ -106,7 +107,7 @@ if [ $G = $HOMEN ]; then
 fi
 if [ $G -lt $NCOMP ]; then K wait vs-$RUN-home- 1 600 >/dev/null; LC=$((SMP/NCOMP)); ST=$((G*LC))
   if [ $G = 0 ]; then (WATCHT="150 300 600" watch_mon 4444 &); timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=0 $GQ -shm-path veilA -append "$GA" -local-cpu $LC,start=0,iplist="$IPL" -monitor tcp:127.0.0.1:4444,server,nowait 2>&1 | stamp $MODE
-    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f home.log ] && grep -a "DSM prof" home.log | awk '$4!="c0=rd0/wr0"||1' | cut -c1-420 | while IFS= read -r x; do L "[prof] $x"; done; [ -f mirror.log ] && { grep -aE "TAKEOVER|takeover|resum|LOST|lost|refused" mirror.log | head -8 | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; }; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done; baselines $SMP
+    K put vs-$RUN-xdone-0 1 >/dev/null; sleep 4; [ -f home.log ] && grep -a "DSM prof" home.log | awk '$4!="c0=rd0/wr0"||1' | cut -c1-420 | while IFS= read -r x; do L "[prof] $x"; done; [ -f mirror.log ] && { grep -aE "TAKEOVER|takeover|resum|LOST|lost|refused" mirror.log | head -8 | while IFS= read -r x; do L "[mirror] $x"; done; tail -2 mirror.log | while IFS= read -r x; do L "[mirror-final] $x"; done; }; [ -f home.log ] && grep -a "DSM home t=" home.log | tail -1 | sed 's/^/[home-final] /' | while IFS= read -r x; do L "$x"; done; sleep 5; baselines $SMP
   else timeout -s KILL $XT chroot /l2r env $SH VEIL_DSM_HOME=$HIP:7910 $H2 VEIL_DSM_ID=$G $GQ -shm-path veilB -append "$GA" -local-cpu $LC,start=$ST,iplist="$IPL" -monitor tcp:127.0.0.1:4445,server,nowait > ap.log 2>&1 & QP=$!; (WATCHT="150 300 600" watch_mon 4445 &)
     (while sleep 30; do grep -a "DSM node$G" ap.log | tail -3 | while IFS= read -r x; do L "[ap$G] $x"; done; done &); K wait vs-$RUN-xdone- 1 $XT >/dev/null; sleep 3; kill -9 $QP 2>/dev/null
     grep -aE "DSM node$G|FAILOVER|lost" ap.log | tail -4 | while IFS= read -r x; do L "[ap$G-final] $x"; done; fi
