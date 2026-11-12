@@ -10,7 +10,7 @@ set -u; MODE=${MODES%% *}; for kv in ${MODES#$MODE}; do case $kv in RA=*|INVQ=*|
 case $MODE in X2) KN=2 SMP=2 NCOMP=2;; X4) KN=2 SMP=4 NCOMP=2;; X3) KN=3 SMP=3 NCOMP=3;; R) KN=3 SMP=2 NCOMP=2;; *) KN=1 SMP=2 NCOMP=2;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); V=$(grep -qw vmx /proc/cpuinfo && echo intel || echo amd)
 if [ "$KN" -gt 1 ]; then
-  K put vs-$RUN-reg-$G "$REG|$V|$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')"; ALL=$(K wait vs-$RUN-reg- $NN $([ $KN -gt 2 ] && echo 900 || echo 300)) || ALL=$(K wait vs-$RUN-reg- $KN 5)
+  K put vs-$RUN-reg-$G "$REG|$V|$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')"; ALL=$(K wait vs-$RUN-reg- $NN 900) || ALL=$(K wait vs-$RUN-reg- $KN 5)
   SEL=$(echo "$ALL" | VENDOR=${VENDOR:-} MODE=$MODE KN=$KN python3 -c "
 import json,sys,os; kn=int(os.environ['KN']); d={int(k.rsplit('-',1)[1]):v.lower() for k,v in json.load(sys.stdin).items()}; c=[]
 for full in (1,0):  # same region+vendor+model first (same TSC rate), then same region+vendor
@@ -22,7 +22,7 @@ if not r and kn==4 and os.environ.get('MODE')=='R':
   pr=[v for k,v in g.items() if len(v)>=2]
   if pr and len(d)>=4: a=pr[0][:2]; r=a+[i for i in sorted(d) if i not in a][:2]
 print(' '.join(map(str,r)) if r else 'none')")
-  S0=$(K wait vs-$RUN-sel- 1 1 2>/dev/null | python3 -c "import json,sys;print(list(json.load(sys.stdin).values())[0])" 2>/dev/null); if [ -n "$S0" ]; then SEL=$S0; else K put vs-$RUN-sel-0 "$SEL" >/dev/null; fi
+  S0=$(K wait vs-$RUN-sel- 1 1 2>/dev/null | python3 -c "import json,sys;print(list(json.load(sys.stdin).values())[0])" 2>/dev/null); if [ -n "$S0" ]; then SEL=$S0; elif [ "$SEL" != none ]; then K put vs-$RUN-sel-0 "$SEL" >/dev/null; fi
   J "{\"kind\":\"pick\",\"gidx\":$G,\"sel\":\"$SEL\"}"
   if [ "$SEL" = none ]; then [ "$G" = 0 ] && K put vs-$RUN-log-x-$(date +%s%N) "NOPAIR no $KN same-region runners: $(echo $ALL | tr -d '{}')" >/dev/null; echo "no group"; exit 0; fi
   P=-1; i=0; for s in $SEL; do [ "$s" = "$G" ] && P=$i; i=$((i+1)); done; [ $P -lt 0 ] && { echo "not picked"; exit 0; }; G=$P
