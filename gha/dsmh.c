@@ -25,7 +25,7 @@
 #define BM 512
 #define MAXC 8
 #define MAXB 256
-enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT, UNREP };
+enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT, UNREP, FENCE };
 struct msg { uint8_t t, has_data; uint16_t from; uint32_t seq; uint64_t pg; };
 static int xfer(int fd, void *b, size_t n, int wr) { char *p = b; while (n) { ssize_t r = wr ? write(fd, p, n) : read(fd, p, n); if (r <= 0) return -1; p += r; n -= r; } return 0; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
@@ -52,6 +52,7 @@ static void dodiff(int src, uint64_t pg) {  /* tmp = page + bitmap */
   for (int w = 0; w < PS / 8; w++) if (bm[w >> 3] >> (w & 7) & 1) { hm[w] = nw[w]; ndiffw++; }
   wrt[pg] = 1; ndiff++; mput(pg); for (int x = 0; x < NC; x++) if (x != src && cs[x] >= 0) sendc(x, UPD, pg, 2, tmp, PS + BM);
   if (rep[pg] == 1 && !looks_pt(mem + pg * PS) && ndq < 4096) { rep[pg] = 2; dq[ndq++] = pg; } }  /* reused as data (freed page table): back to single-writer */
+static unsigned long nfen;
 static void waitack(int x, uint64_t pg) {
   if (dly && x == 1) usleep(dly);  /* VEIL_DSM_DELAY_US: emulate the cross-runner link to client 1 on one host */
   for (;;) { struct msg r; if (recvc(x, &r)) fatal_client(x);
@@ -95,8 +96,8 @@ static void derep(uint64_t pg) {  /* every holder flushes its diff and drops wri
   for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) waitack(x, pg);
   rep[pg] = 0; same[pg] = 0; for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) sendc(x, INVQ, pg, 0, 0, 0); sh[pg] = 0; owner[pg] = -1; mput(pg); nderep++; }
 static void stats(void) {
-  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu%s data_MiB=%.1f\n",
-    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
+  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu%s data_MiB=%.1f\n",
+    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
   fprintf(stderr, "DSM hot:"); for (int k = 0; k < 6; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u%s/s%u", bi, hot[bi], rep[bi] ? "R" : "", same[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
 static int listen_on(int port) { int ls = socket(AF_INET, SOCK_STREAM, 0); setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 16)) { perror("bind"); exit(1); } return ls; }
@@ -122,6 +123,10 @@ static int serve(int ls) {
       if (!live && nreq) break; if (poll(p, k, 1000) <= 0) continue; int got = -1; for (int i = 0; i < k; i++) if (p[i].revents) { got = i; break; } if (got < 0) continue;
       if (idx[got] < 0) { accept_client(ls); continue; } int c = idx[got]; rr = c + 1; cur.c = c;
       if (recvc(c, &cur.m)) { fprintf(stderr, "DSM home: client %d closed\n", c); close(cs[c]); cs[c] = -1; int any = 0; for (int x = 0; x < NC; x++) any |= cs[x] >= 0; if (!any) break; continue; } }
+    if (cur.m.t == FENCE) { uint64_t pr = (1ULL << 62) | (cur.m.pg & 0xffffffffULL) | ((uint64_t)cur.c << 40); nfen++;  /* every other node has applied all earlier UPDs before the fencing node may send its interrupt */
+      for (int x = 0; x < NC; x++) if (x != cur.c && cs[x] >= 0) sendc(x, FENCE, pr, 0, 0, 0);
+      for (int x = 0; x < NC; x++) if (x != cur.c && cs[x] >= 0) waitack(x, pr);
+      sendc(cur.c, FENCE, cur.m.pg, 0, 0, 0); continue; }
     if (cur.m.t == DIFF) { if (xfer(cs[cur.c], tmp, PS + BM, 0)) fatal_client(cur.c); if (cur.m.pg < np) dodiff(cur.c, cur.m.pg); while (ndq) derep(dq[--ndq]); continue; }
     handle(cur.c, &cur.m); while (ndq) derep(dq[--ndq]); }
   stats(); fprintf(stderr, "DSM home done\n"); return 0; }
