@@ -120,8 +120,13 @@ static void do_wr(int c, uint64_t pg) {
   if (n > 1) cork(c, 1);
   for (int i = 0; i < n; i++) { uint64_t p = L[i]; if (sh[p] >> c & 1) sendc(c, GRANT_M, p, 0, 0, 0); else { sendc(c, DATA_M, p, wrt[p], wrt[p] ? mem + p * PS : 0, PS); if (!wrt[p]) nzero++; } owner[p] = c; sh[p] = 0; }
   if (n > 1) { cork(c, 0); nwa += n - 1; } }
+/* VEIL_DSM_HOLD_US: a node that was just granted a page exclusively keeps it for at least this long; a competing request is
+   parked until then. Without it a contended page (lock, shared counter) moves on every single access, and each move is a
+   network round trip; with it the owner gets a burst of work per move. */
+static struct q defq[1024]; static double defdue[1024]; static int ndef; static double hold_s; static unsigned long nheld;
 static void handle(int c, struct msg *m) {
-  if (m->t != RD && m->t != WR) return; if (dly && c == 1) usleep(dly); uint64_t pg = m->pg; if (pg >= np) { fprintf(stderr, "bad page %llx\n", (unsigned long long)pg); return; } nreq++;
+  if (m->t != RD && m->t != WR) return;
+  if (hold_s > 0 && m->pg < np && owner[m->pg] >= 0 && owner[m->pg] != c && !rep[m->pg] && !(swr && swr[m->pg]) && ndef < 1024) { double due = gt[m->pg] + hold_s; if (due > now()) { defq[ndef].c = c; defq[ndef].m = *m; defdue[ndef++] = due; nheld++; return; } } if (dly && c == 1) usleep(dly); uint64_t pg = m->pg; if (pg >= np) { fprintf(stderr, "bad page %llx\n", (unsigned long long)pg); return; } nreq++;
   if (pcnt) { pcnt[pg]++; pmask[pg] |= (m->t == WR ? 0x10 : 0x01) << (c & 3); pt_req[c & 7][m->t == WR]++; }
   if (swr && swr[pg]) { int w = swr[pg] - 1;
     if (m->t == RD && c != w) { sendc(w, SWSYNC, pg, 0, 0, 0); waitack(w, pg); nswsync++; sendc(c, SWDATA, pg, 1, mem + pg * PS, PS); sh[pg] |= 1 << c; return; }
@@ -143,8 +148,8 @@ static void derep(uint64_t pg) {  /* every holder flushes its diff and drops wri
   for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) waitack(x, pg);
   rep[pg] = 0; same[pg] = 0; for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) sendc(x, INVQ, pg, 0, 0, 0); sh[pg] = 0; owner[pg] = -1; mput(pg); nderep++; }
 static void stats(void) {
-  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu%s data_MiB=%.1f\n",
-    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
+  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu held=%lu%s data_MiB=%.1f\n",
+    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, nheld, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
   fprintf(stderr, "DSM hot:"); for (int k = 0; k < 6; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u%s/s%u", bi, hot[bi], rep[bi] ? "R" : "", same[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
 static int listen_on(int port) { int ls = socket(AF_INET, SOCK_STREAM, 0); setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 16)) { perror("bind"); exit(1); } return ls; }
@@ -166,7 +171,7 @@ static void accept_client(int ls) {  /* handshake: u16 id (bit15 = resume after 
 static void init(size_t n, int nc) { np = n; NC = nc; mem = calloc(np, PS); wrt = calloc(np, 1); sh = calloc(np, 1); rep = calloc(np, 1); owner = malloc(np); memset(owner, -1, np); same = calloc(np, 2); hot = calloc(np, 4); lbm = calloc(np, sizeof *lbm); lsrc = calloc(np, 1); ltime = calloc(np, sizeof(double)); gt = calloc(np, sizeof(double)); gown = malloc(np); memset(gown, -1, np); if (getenv("VEIL_DSM_HOTWIN_MS")) hotwin = atof(getenv("VEIL_DSM_HOTWIN_MS")) / 1e3;
   for (int i = 0; i < MAXC; i++) cs[i] = -1; t_start = now(); invq = getenv("VEIL_DSM_INVQ") && atoi(getenv("VEIL_DSM_INVQ"));
   repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; repsilent = getenv("VEIL_DSM_REPSILENT") ? atoi(getenv("VEIL_DSM_REPSILENT")) : 0; dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; ramax = getenv("VEIL_DSM_RA") ? atoi(getenv("VEIL_DSM_RA")) : 0; if (ramax > MAXB) ramax = MAXB;
-  swmin = getenv("VEIL_DSM_SW") ? atoi(getenv("VEIL_DSM_SW")) : 0; if (swmin > 0) { swr = calloc(np, 1); ppc = calloc(np, 2); pwm = calloc(np, 1); ppt = calloc(np, sizeof(float)); } }
+  hold_s = getenv("VEIL_DSM_HOLD_US") ? atof(getenv("VEIL_DSM_HOLD_US")) / 1e6 : 0; swmin = getenv("VEIL_DSM_SW") ? atoi(getenv("VEIL_DSM_SW")) : 0; if (swmin > 0) { swr = calloc(np, 1); ppc = calloc(np, 2); pwm = calloc(np, 1); ppt = calloc(np, sizeof(float)); } }
 static void prof(void) {  /* VEIL_DSM_PROF_S: per-interval request counts per client and the hottest pages (mask: low nibble = readers, high = writers, bit = client) */
   fprintf(stderr, "DSM prof t=%.1f", now() - t_start); for (int c = 0; c < NC; c++) fprintf(stderr, " c%d=rd%lu/wr%lu", c, pt_req[c][0], pt_req[c][1]); memset(pt_req, 0, sizeof pt_req); fprintf(stderr, " top:");
   for (int k = 0; k < 12; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (pcnt[i] > pcnt[bi]) bi = i; if (!pcnt[bi]) break; fprintf(stderr, " %zx:%u:%02x%s", bi, pcnt[bi], pmask[bi], rep[bi] ? "R" : swr && swr[bi] ? "S" : ""); pcnt[bi] = 0; }
@@ -178,10 +183,12 @@ static int serve(int ls) {
     if (pcnt && now() - tp > prof_s) { tp = now(); prof(); }
     if (now() - tl > 10) { tl = now(); stats(); }
     struct q cur;
-    if (npend) { cur = pend[0]; memmove(pend, pend + 1, --npend * sizeof *pend); }
+    int di = -1; double dmin = 1e18; if (ndef) { double tn = now(); for (int i = 0; i < ndef; i++) { if (defdue[i] <= tn) { di = i; break; } if (defdue[i] < dmin) dmin = defdue[i]; } }
+    if (di >= 0) { cur = defq[di]; memmove(defq + di, defq + di + 1, (ndef - di - 1) * sizeof *defq); memmove(defdue + di, defdue + di + 1, (ndef - di - 1) * sizeof *defdue); ndef--; }
+    else if (npend) { cur = pend[0]; memmove(pend, pend + 1, --npend * sizeof *pend); }
     else if (buffered(&cur)) { if (recvc(cur.c, &cur.m)) { fprintf(stderr, "DSM home: client %d closed\n", cur.c); close(cs[cur.c]); cs[cur.c] = -1; rbh[cur.c] = rbt[cur.c] = 0; continue; } }
     else { if (mout) mflush(); struct pollfd p[MAXC + 1]; int idx[MAXC + 1], k = 0, live = 0; for (int i = 0; i < NC; i++) { int c = (rr + i) % NC; if (cs[c] >= 0) { p[k].fd = cs[c]; p[k].events = POLLIN; idx[k++] = c; live++; } } p[k].fd = ls; p[k].events = POLLIN; idx[k++] = -1;
-      if (!live && nreq) break; if (poll(p, k, 1000) <= 0) continue; int got = -1; for (int i = 0; i < k; i++) if (p[i].revents) { got = i; break; } if (got < 0) continue;
+      if (!live && nreq) break; int tmo = 1000; if (ndef) { double w = (dmin - now()) * 1e3; tmo = w <= 0 ? 0 : w < 1 ? 1 : (int)w; if (w > 0 && w < 1) { struct timespec ts = {0, (long)(w * 1e6)}; if (ppoll(p, k, &ts, 0) <= 0) continue; } else if (poll(p, k, tmo) <= 0) continue; } else if (poll(p, k, tmo) <= 0) continue; int got = -1; for (int i = 0; i < k; i++) if (p[i].revents) { got = i; break; } if (got < 0) continue;
       if (idx[got] < 0) { accept_client(ls); continue; } int c = idx[got]; rr = c + 1; cur.c = c;
       if (recvc(c, &cur.m)) { fprintf(stderr, "DSM home: client %d closed\n", c); close(cs[c]); cs[c] = -1; int any = 0; for (int x = 0; x < NC; x++) any |= cs[x] >= 0; if (!any) break; continue; } }
     if (cur.m.t == FENCE) { uint64_t pr = (1ULL << 62) | (cur.m.pg & 0xffffffffULL) | ((uint64_t)cur.c << 40); nfen++;  /* every other node has applied all earlier UPDs before the fencing node may send its interrupt */
