@@ -4,7 +4,7 @@ cd "$(dirname "$0")"; MIB=${MIB:-256}; NPG=$((MIB * 256)); PORT=${PORT:-7910}
 gcc -O2 -o dsmt dsmt.c && gcc -O2 -o dsmh ${SRC:-..}/dsmh.c && gcc -O2 -shared -fPIC -o dsm_shim.so ${SRC:-..}/dsm_shim.c -ldl -lpthread || exit 1
 rm -f /dev/shm/veilT*; pkill -9 -x dsmh 2>/dev/null; pkill -9 -x dsmt 2>/dev/null
 if [ "${1:-dsm}" = base ]; then ./dsmt 1 /dev/shm/veilT $MIB $ITERS & ./dsmt 0 /dev/shm/veilT $MIB $ITERS; wait; rm -f /dev/shm/veilT*; exit; fi
-E="${MSYNC:+VEIL_DSM_MSYNC=1} VEIL_DSM_SW=${SW:-0} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPMIN=16 VEIL_DSM_PREFILL=1 VEIL_DSM_DELAY_US=${DELAY_US:-0}"
+E="VEIL_DSM_HOLD_US=${HOLD_US:-0} ${MSYNC:+VEIL_DSM_MSYNC=1} VEIL_DSM_SW=${SW:-0} VEIL_DSM_RA=${RA:-64} VEIL_DSM_INVQ=${INVQ:-0} VEIL_DSM_REPMIN=16 VEIL_DSM_PREFILL=1 VEIL_DSM_DELAY_US=${DELAY_US:-0}"
 if [ -n "$MIRROR" ]; then env $E ./dsmh mirror $((PORT+10)) $NPG 2 $((PORT+11)) 2> mirror.log & sleep 0.3; M=127.0.0.1:$((PORT+11)); fi
 env $E ./dsmh home $PORT $NPG 2 $M 2> home.log & sleep 0.3
 if [ -n "$KILLAT" ]; then H2="VEIL_DSM_HOME2=127.0.0.1:$((PORT+10)) VEIL_DSM_FAILOVER_S=${FOS:-3}"; (sleep $KILLAT; pkill -9 -f "dsmh home"; echo "FAULT_INJECTED primary home killed at ${KILLAT}s") & fi
