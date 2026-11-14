@@ -99,13 +99,26 @@ static int batchlen(int c, int t, uint64_t pg) {  /* sequential stream detection
   if (pg + k >= np) k = np - 1 - pg; lstart[c][t] = pg; lend[c][t] = pg + k; return k; }
 /* BATCH: tell the node which pages of a read-/write-ahead batch are on their way, so a vCPU that reaches one of them
    before it is installed waits for it instead of asking again (which re-sent the page and reset the stream) */
-static void announce(int c, uint64_t *L, int n, int wr) { if (n < 2) return; uint64_t b[MAXB / 64 + 1]; memset(b, 0, sizeof b); uint64_t p0 = L[0];
-  for (int i = 0; i < n; i++) { uint64_t d = L[i] - p0; if (d <= MAXB) b[d / 64] |= 1ull << (d % 64); }
+static void announce(int c, uint64_t *L, int n, int wr) { if (n < 2) return; uint64_t b[MAXB / 64 + 1]; memset(b, 0, sizeof b); uint64_t p0 = L[0], p1 = L[0];
+  for (int i = 1; i < n; i++) { if (L[i] < p0) p0 = L[i]; if (L[i] > p1) p1 = L[i]; } if (p1 - p0 > MAXB) return;  /* wide stride: no announcement, still correct */
+  for (int i = 0; i < n; i++) { uint64_t d = L[i] - p0; b[d / 64] |= 1ull << (d % 64); }
   struct msg m = {.t = BATCH, .has_data = 1, .from = (uint16_t)gcnt[c], .seq = sseq[c]++, .pg = p0 | ((uint64_t)wr << 63)}; if (mout) mflush(); if (cs[c] < 0) return;
   if (xfer(cs[c], &m, sizeof m, 1) || xfer(cs[c], b, sizeof b, 1)) fatal_client(c); }
+/* Learned read prefetch, on top of the sequential stream (batchlen):
+   - stride: the same page delta >1 seen 3 times in a row -> the next k pages along that stride
+   - working set (VEIL_DSM_REGION=misses, default 8): a node that misses that many distinct pages of one 2 MiB region within
+     1 s (random reads of a table, a heap, model weights) gets every page of the region it lacks in one batch, unless
+     another node wrote into the region in the last 50 ms (write-hot data is left to on-demand fetches) */
+#define RG 512
+static uint16_t *rmiss; static float *rmt, *rwt; static int rthresh = 8; static int64_t sl_pg[MAXC], sl_d[MAXC]; static int sl_n[MAXC]; static unsigned long nstride, nregion;
+static int fetchable(uint64_t q, int c) { return !rep[q] && !(swr && swr[q]) && owner[q] != c && !(sh[q] >> c & 1); }
 static void do_rd(int c, uint64_t pg) {
   uint64_t L[MAXB + 1]; int n = 0, k = batchlen(c, 1, pg); L[n++] = pg;
-  double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; /* another node used it just now: stop speculating */ if (!rep[q] && !(swr && swr[q]) && owner[q] != c && !(sh[q] >> c & 1)) L[n++] = q; }
+  double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; /* another node used it just now: stop speculating */ if (fetchable(q, c)) L[n++] = q; }
+  int64_t d = (int64_t)pg - sl_pg[c]; if (d == sl_d[c] && d != 1 && d != 0) sl_n[c]++; else sl_n[c] = 0; sl_d[c] = d; sl_pg[c] = pg;
+  if (n == 1 && sl_n[c] >= 2 && rthresh) { int ks = sl_n[c] < 7 ? 1 << sl_n[c] : 128; for (int i = 1; i <= ks && n <= MAXB; i++) { int64_t q = (int64_t)pg + d * i; if (q < 0 || q >= (int64_t)np) break; if (gown[q] != c && tn - gt[q] < hotwin) break; if (fetchable(q, c)) L[n++] = q; } if (n > 1) nstride++; }
+  if (n == 1 && rmiss && rthresh) { size_t r = pg / RG, ri = r * MAXC + c; float tf = tn - t_start; if (tf - rmt[ri] > 1) { rmt[ri] = tf; rmiss[ri] = 0; } rmiss[ri]++;
+    if (rmiss[ri] >= rthresh && tf - rwt[r] > 0.05) { rmiss[ri] = 0; for (uint64_t q = r * RG; q < (r + 1) * RG && q < np && n <= MAXB; q++) if (q != pg && fetchable(q, c) && !(gown[q] != c && tn - gt[q] < hotwin)) L[n++] = q; if (n > 1) nregion++; } }
   if (n > 1) corkothers(c, 1);  /* a batch of recalls leaves as one burst, not one packet per page */
   int wx[MAXB + 1]; for (int i = 0; i < n; i++) { int o = owner[L[i]]; wx[i] = -1; if (o >= 0 && o != c) { sendc(o, RECALL, L[i], 0, 0, 0); nrecall++; hot[L[i]]++; wx[i] = o; } }
   if (n > 1) corkothers(c, 0);
@@ -138,10 +151,11 @@ static int do_lease(int c, uint64_t pg) {
     sendc(c, GRANTR, s, 1, bm[b], sizeof bm[b]); }
   cork(c, 0); lnext[c] = b0 + (uint64_t)nb * LB; lrun[c] = nb; nlease++; nlease_pg += got; return 1; }
 static void do_wr(int c, uint64_t pg) {
+  if (rwt) rwt[pg / RG] = now() - t_start;
   if (owner[pg] == c) { sendc(c, GRANT_M, pg, 0, 0, 0); return; }
   if (do_lease(c, pg)) return;
   uint64_t L[MAXB + 1]; int n = 0, k = batchlen(c, 2, pg); L[n++] = pg;
-  double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; if (!rep[q] && !(swr && swr[q]) && owner[q] != c) L[n++] = q; }
+  double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; if (!rep[q] && !(swr && swr[q]) && owner[q] < 0) L[n++] = q; }  /* never steal another node's written page on speculation */
   if (n > 1) corkothers(c, 1);
   int wx[MAXB + 1][MAXC]; for (int i = 0; i < n; i++) { uint64_t p = L[i]; for (int x = 0; x < NC; x++) { wx[i][x] = 0; if (x == c) continue;
       if (owner[p] == x) { sendc(x, INV, p, 0, 0, 0); ninv++; hot[p]++; wx[i][x] = 1; }
@@ -179,8 +193,8 @@ static void derep(uint64_t pg) {  /* every holder flushes its diff and drops wri
   for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) waitack(x, pg);
   rep[pg] = 0; same[pg] = 0; for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) sendc(x, INVQ, pg, 0, 0, 0); sh[pg] = 0; owner[pg] = -1; mput(pg); nderep++; }
 static void stats(void) {
-  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu held=%lu leases=%lu lease_pages=%lu%s data_MiB=%.1f\n",
-    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, nheld, nlease, nlease_pg, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
+  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu held=%lu leases=%lu lease_pages=%lu stride_pf=%lu region_pf=%lu%s data_MiB=%.1f\n",
+    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, nheld, nlease, nlease_pg, nstride, nregion, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
   fprintf(stderr, "DSM hot:"); for (int k = 0; k < 6; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u%s/s%u", bi, hot[bi], rep[bi] ? "R" : "", same[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
 static int listen_on(int port) { int ls = socket(AF_INET, SOCK_STREAM, 0); setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 16)) { perror("bind"); exit(1); } return ls; }
@@ -202,6 +216,7 @@ static void accept_client(int ls) {  /* handshake: u16 id (bit15 = resume after 
 static void init(size_t n, int nc) { np = n; NC = nc; mem = calloc(np, PS); wrt = calloc(np, 1); sh = calloc(np, 1); rep = calloc(np, 1); owner = malloc(np); memset(owner, -1, np); same = calloc(np, 2); hot = calloc(np, 4); lbm = calloc(np, sizeof *lbm); lsrc = calloc(np, 1); ltime = calloc(np, sizeof(double)); gt = calloc(np, sizeof(double)); gown = malloc(np); memset(gown, -1, np); if (getenv("VEIL_DSM_HOTWIN_MS")) hotwin = atof(getenv("VEIL_DSM_HOTWIN_MS")) / 1e3;
   for (int i = 0; i < MAXC; i++) cs[i] = -1; t_start = now(); invq = getenv("VEIL_DSM_INVQ") && atoi(getenv("VEIL_DSM_INVQ"));
   repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; repsilent = getenv("VEIL_DSM_REPSILENT") ? atoi(getenv("VEIL_DSM_REPSILENT")) : 0; dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; ramax = getenv("VEIL_DSM_RA") ? atoi(getenv("VEIL_DSM_RA")) : 0; if (ramax > MAXB) ramax = MAXB;
+  if (getenv("VEIL_DSM_REGION")) rthresh = atoi(getenv("VEIL_DSM_REGION")); if (rthresh) { rmiss = calloc((np / RG + 1) * MAXC, 2); rmt = calloc((np / RG + 1) * MAXC, sizeof(float)); rwt = calloc(np / RG + 1, sizeof(float)); for (size_t i = 0; i <= np / RG; i++) rwt[i] = -1; }
   batchann = !getenv("VEIL_DSM_BATCHANN") || atoi(getenv("VEIL_DSM_BATCHANN")); lease_max = getenv("VEIL_DSM_LEASE") ? atoi(getenv("VEIL_DSM_LEASE")) : 0; for (int i = 0; i < MAXC; i++) lnext[i] = -1;
   hold_s = getenv("VEIL_DSM_HOLD_US") ? atof(getenv("VEIL_DSM_HOLD_US")) / 1e6 : 0; swmin = getenv("VEIL_DSM_SW") ? atoi(getenv("VEIL_DSM_SW")) : 0; if (swmin > 0) { swr = calloc(np, 1); ppc = calloc(np, 2); pwm = calloc(np, 1); ppt = calloc(np, sizeof(float)); } }
 static void prof(void) {  /* VEIL_DSM_PROF_S: per-interval request counts per client and the hottest pages (mask: low nibble = readers, high = writers, bit = client) */
