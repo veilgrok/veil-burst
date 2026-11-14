@@ -66,6 +66,6 @@ int main(int c, char **v) {
   /* correctness: stream/touch values are checked locally; shared counters must add up exactly */
   int bad = (int)bad_g;
   if (!strcmp(w, "stream")) for (int k = k0; k < k1; k++) { size_t lo, hi; slice(np, NN, k, &lo, &hi); double *a = (double *)(b + lo * PS); size_t m = (hi - lo) * PS / 8 / 3; for (size_t i = 0; i < m; i += 97) bad += a[i] != (double)i + 3.0; }
-  barrier(3); if (!strcmp(w, "shared")) { if (id <= 0) { uint64_t tot = 0; for (int q = 0; q < 4; q++) tot += ((volatile uint64_t *)(b + 2 * PS))[q * 8]; long every = arg > 0 ? arg : 1000, ops = (long)(4e8 * SC / ((long)NN * T)), want = 0; for (long k = 0; k < (long)NN * T; k++) want += (ops + every - 1) / every; bad += tot != (uint64_t)want; } }
+  barrier(3); if (!strcmp(w, "shared")) { if (id <= 0) { uint64_t tot = 0; for (int q = 0; q < 4; q++) tot += ((volatile uint64_t *)(b + 2 * PS))[q * 8]; long every = arg > 0 ? arg : 1000, ops = (long)(4e8 * SC / ((long)NN * T)), want = 0; for (long k = 0; k < (long)NN * T; k++) want += (ops + every - 1) / every; bad += tot != (uint64_t)want; if (tot != (uint64_t)want) fprintf(stderr, "DSMN shared tot=%llu want=%ld\n", (unsigned long long)tot, want); } }
   printf("DSMN node%d n=%d work=%s compute_s=%.3f job_s=%.3f chk=%llx bad=%d\n", id, NN, w, t1 - t0, t2 - t0, (unsigned long long)chk, bad); fflush(stdout);
   barrier(4); usleep(200000); return 0; }
