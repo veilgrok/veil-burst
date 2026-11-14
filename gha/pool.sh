@@ -2,11 +2,11 @@
 # Pooled-memory scaling runs on K runners (MODES="P ..."): strong scaling of gha/localtest/dsmn.c over the DSM home, one
 # DSM node per runner with THREADS = that runner's cores, against the same job on ONE runner with all its cores and no DSM.
 # Then the correctness gates: dsmt cross-check/torture between runners 0 and 1, and a kill of the primary home (runner 2,
-# mirror on runner 0) mid-run. Knobs (in MODES after P): KN=runners (4) NS="1 2 4" WL="cpu stream gather shared touch"
+# mirror on runner 0) mid-run. Knobs (in MODES after P): KN=runners (4) NS=1,2,4 WL=cpu,stream,gather,shared,touch
 #   MIB=per-node shm size (2048) RA (1024) LEASE (8192) REGION (8) CLEANACK (1) SW (0) HOLD_US (0) GATES=1 KILLAT (secs, 2.0)
 # Every result line is "POOL ..." in the run log (via the relay KV, like vsplit2.sh). Speedup = base_s / job_s(N).
 set -u; for kv in ${MODES#P}; do case $kv in KN=*|NS=*|WL=*|MIB=*|RA=*|LEASE=*|REGION=*|CLEANACK=*|SW=*|HOLD_US=*|GATES=*|KILLAT=*) export "$kv";; esac; done
-KN=${KN:-4}; NS=${NS:-1 2 4}; WL=${WL:-cpu stream gather shared touch}; MIB=${MIB:-2048}; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }
+KN=${KN:-4}; NS=$(echo ${NS:-1,2,4} | tr , " "); WL=$(echo ${WL:-cpu,stream,gather,shared,touch} | tr , " "); MIB=${MIB:-2048}; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')
 K put pl-$RUN-reg-$G "$REG|$CPU|$(nproc)"; ALL=$(K wait pl-$RUN-reg- $NN 900) || ALL=$(K wait pl-$RUN-reg- $KN 5)
 SEL=$(echo "$ALL" | KN=$KN python3 -c "
