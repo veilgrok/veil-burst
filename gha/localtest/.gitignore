@@ -2,3 +2,8 @@ dsmt
 dsmh
 dsm_shim.so
 *.log
+dsmn
+dsmh_s
+shim_s.so
+lag
+*.log
