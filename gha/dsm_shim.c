@@ -41,7 +41,7 @@ struct uffdio_writeprotect { struct uffdio_range range; __u64 mode; };
 #define UFFDIO_COPY_MODE_WP ((__u64)1 << 1)
 #endif
 #define PS 4096
-enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT_, UNREP, FENCE, SWW, SWDATA, SWGRANT, SWDEMOTE, SWSYNC, DIFFB, UPDB };
+enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT_, UNREP, FENCE, SWW, SWDATA, SWGRANT, SWDEMOTE, SWSYNC, DIFFB, UPDB, INVR, GRANTR, BATCH };
 #define SWB 64
 #define BM 4096  /* diff payload: new words + per-word bit masks of what this node changed */
 #define MAXREP 8192
@@ -88,7 +88,7 @@ static int failover(void) {
   int nre = 0; for (size_t pg = 0; pg < np; pg++) if (pending[pg]) { struct msg q = {.t = pending[pg], .from = myid, .pg = pg}; sendm_locked(&q, 0, 0); nre++; }
   pthread_mutex_unlock(&smu); nfailover++;
   fprintf(stderr, "DSM node%d: FAILOVER done in %.3fs (states=%u unmirrored_wb=%u replicated=%u reissued=%d)\n", myid, now() - t0, n, ng, nr, nre); return 0; }
-static unsigned long nswin, nswfail, nbatch_out, nbatch_in, nping, nclean; static int cleanack; static volatile double last_rx;
+static unsigned long nlease_c, nlease_pg_c, nbann; static unsigned long nswin, nswfail, nbatch_out, nbatch_in, nping, nclean; static int cleanack; static volatile double last_rx;
 /* single-writer replica update: the guest sees either the whole old page or the whole new one (seqcount-safe):
    the page is read-only here (WP), so copy it, merge the writer's bits, punch it out (vCPU reads now block in uffd), install */
 static void swinstall(uint64_t pg, const uint64_t *nw, const uint64_t *mk, char *ib) {
@@ -110,6 +110,20 @@ static void *receiver(void *a) {
     if (nghost) ghost_confirm(m.from);
     if (m.t == FENCE && (m.pg >> 62)) { struct msg r = {.t = ACK, .from = myid, .pg = m.pg}; pthread_mutex_lock(&smu); sendm_locked(&r, 0, 0); pthread_mutex_unlock(&smu); continue; }
     if (m.t == FENCE) { pthread_mutex_lock(&fmu); fdone = m.pg; pthread_cond_broadcast(&fcv); pthread_mutex_unlock(&fmu); continue; }
+    if (m.t == BATCH) { uint64_t b[1024 / 64 + 1]; if (srd(b, sizeof b)) continue; int wr = pg >> 63; uint64_t p0 = pg & ~(1ull << 63); nbann++;
+      pthread_mutex_lock(&mu); for (int d = 0; d <= 1024; d++) if ((b[d / 64] >> (d % 64) & 1) && p0 + d < np && pending[p0 + d] < (wr ? WR : RD)) pending[p0 + d] = wr ? WR : RD; pthread_mutex_unlock(&mu); continue; }
+    if (m.t == INVR || m.t == GRANTR) {  /* first-touch lease: a 512-page block, bitmap payload (see dsmh.c do_lease) */
+      uint64_t bm[8]; if (srd(bm, sizeof bm)) continue; size_t run0 = 0; int inrun = 0; unsigned long k = 0;
+      for (int i = 0; i <= 512; i++) { uint64_t p = pg + i; int set = i < 512 && p < np && (bm[i / 64] >> (i % 64) & 1);
+        if (set && m.t == INVR && st[p] != 1) set = 0;  /* only zero shared copies are dropped this way */
+        if (set) { if (!inrun) { run0 = p; inrun = 1; } if (m.t == GRANTR) { if (st[p] == 0) { static char *zb; if (!zb) zb = aligned_alloc(PS, PS), memset(zb, 0, PS); struct uffdio_copy c = {.dst = (uintptr_t)base + p * PS, .src = (uintptr_t)zb, .len = PS, .mode = 0}; if (ioctl(uffd, UFFDIO_COPY, &c)) setwp(p, 0); } st[p] = 2; } else st[p] = 0; k++; continue; }
+        if (inrun) { inrun = 0; size_t len = (p - run0) * PS;
+          if (m.t == GRANTR) { struct uffdio_writeprotect w = {.range = {(uintptr_t)base + run0 * PS, len}, .mode = 0}; ioctl(uffd, UFFDIO_WRITEPROTECT, &w); }
+          else fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, run0 * PS, len); } }
+      if (m.t == INVR) { struct msg r = {.t = ACK, .pg = pg | (1ull << 61)}; sendm(&r, 0); ninv_c += k; continue; }
+      nlease_c++; nlease_pg_c += k; pthread_mutex_lock(&mu); double tn = now();
+      for (int i = 0; i < 512 && pg + i < np; i++) { uint64_t p = pg + i; if ((bm[i / 64] >> (i % 64) & 1) && pending[p]) { pending[p] = 0; if (fault_t0[p] > 0) { stall_sum += tn - fault_t0[p]; nstall++; fault_t0[p] = 0; } wake(p); } }
+      pthread_mutex_unlock(&mu); continue; }
     if (m.t == UPD) { if (srd(buf, PS + BM)) continue; uint64_t *mk = (uint64_t *)(buf + PS), *nw = (uint64_t *)buf, *pw = (uint64_t *)(base + pg * PS);
       if (st[pg] == 4) { swinstall(pg, nw, mk, ib); nupd_in++; continue; }
       pthread_mutex_lock(&rmu); uint32_t i = repidx[pg];
@@ -166,7 +180,7 @@ static void *receiver(void *a) {
 static void *faulter(void *a) {
   double last = now(), lastwd = now(), wd = getenv("VEIL_DSM_FAILOVER_S") ? atof(getenv("VEIL_DSM_FAILOVER_S")) : 5;
   for (;;) { struct pollfd p = {uffd, POLLIN, 0}; int r = poll(&p, 1, 500);
-    if (now() - last > 10) { last = now(); fprintf(stderr, "DSM node%d faults read=%lu write=%lu wp_upgrade=%lu replies=%lu unsolicited=%lu zero=%lu recalls=%lu invs=%lu replicated=%u diffs_out=%lu upd_in=%lu seq_err=%lu failovers=%lu stall_avg_us=%.1f fences=%lu fence_timeouts=%lu rep_drop=%lu rep_skip=%lu upd_drop=%lu relflush=%lu sw_install=%lu sw_fail=%lu batches_out=%lu batches_in=%lu clean_acks=%lu unmirrored_now=%d unmirrored_overflow=%lu\n", myid, nfault_r, nfault_w, nfault_wp, nrecv, nunsol, nzero_c, nrecall_c, ninv_c, nrepl, ndiff_out, nupd_in, seqerr_c, nfailover, nstall ? stall_sum / nstall * 1e6 : 0, nfence, nfence_to, nrepdrop, nrepskip, nupd_drop, nrelflush, nswin, nswfail, nbatch_out, nbatch_in, nclean, nghost, nghost_full); }
+    if (now() - last > 10) { last = now(); fprintf(stderr, "DSM node%d faults read=%lu write=%lu wp_upgrade=%lu replies=%lu unsolicited=%lu zero=%lu recalls=%lu invs=%lu replicated=%u diffs_out=%lu upd_in=%lu seq_err=%lu failovers=%lu stall_avg_us=%.1f fences=%lu fence_timeouts=%lu rep_drop=%lu rep_skip=%lu upd_drop=%lu relflush=%lu sw_install=%lu sw_fail=%lu batches_out=%lu batches_in=%lu clean_acks=%lu unmirrored_now=%d unmirrored_overflow=%lu leases=%lu lease_pages=%lu\n", myid, nfault_r, nfault_w, nfault_wp, nrecv, nunsol, nzero_c, nrecall_c, ninv_c, nrepl, ndiff_out, nupd_in, seqerr_c, nfailover, nstall ? stall_sum / nstall * 1e6 : 0, nfence, nfence_to, nrepdrop, nrepskip, nupd_drop, nrelflush, nswin, nswfail, nbatch_out, nbatch_in, nclean, nghost, nghost_full, nlease_c, nlease_pg_c); }
     { static double lst; if (now() - lst > 10) { lst = now(); double tn = now(); int ns = 0; for (size_t i = 0; i < np; i++) if (fault_t0[i] > 0 && tn - fault_t0[i] > 2) { if (ns++ < 4) fprintf(stderr, "DSM node%d STALL pg=%zx age=%.1fs pending=%d st=%d\n", myid, i, tn - fault_t0[i], pending[i], st[i]); } if (ns) fprintf(stderr, "DSM node%d STALL total=%d\n", myid, ns); } }
     /* liveness with a standby: a node served from its own replicas may send nothing for long; ping the home every
        second of silence and declare it dead after FAILOVER_S without any message (a silently dead home sends no RST) */
@@ -249,6 +263,11 @@ static void attach(void *p, size_t len, int fd, const char *tgt) {
     size_t ch = 2u << 20; char *z = aligned_alloc(PS, ch); memset(z, 0, ch); double t0 = now();
     for (size_t o = 0; o < len; o += ch) { struct uffdio_copy c = {.dst = (uintptr_t)p + o, .src = (uintptr_t)z, .len = len - o < ch ? len - o : ch, .mode = UFFDIO_COPY_MODE_WP}; if (ioctl(uffd, UFFDIO_COPY, &c)) { perror("DSM prefill"); break; } }
     memset(st, 1, np); fprintf(stderr, "DSM node%d prefilled %zu MiB as shared-zero in %.3fs\n", myid, len >> 20, now() - t0); free(z); }
+  if (getenv("VEIL_DSM_OWNMAP")) {  /* affinity placement (must match the home's VEIL_DSM_OWNMAP): own ranges start writable, others' start absent */
+    char *m = strdup(getenv("VEIL_DSM_OWNMAP")), *sv = 0; for (char *t = strtok_r(m, ",", &sv); t; t = strtok_r(0, ",", &sv)) { int id; unsigned long lo, hi; if (sscanf(t, "%d:%lu-%lu", &id, &lo, &hi) != 3 || lo >= np) continue; if (hi >= np) hi = np - 1;
+      size_t len = (hi - lo + 1) * PS; if (id == myid) { if (!getenv("VEIL_DSM_PREFILL") || !atoi(getenv("VEIL_DSM_PREFILL"))) { char *z = aligned_alloc(PS, PS); memset(z, 0, PS); for (unsigned long q = lo; q <= hi; q++) { struct uffdio_copy c = {.dst = (uintptr_t)p + q * PS, .src = (uintptr_t)z, .len = PS, .mode = 0}; ioctl(uffd, UFFDIO_COPY, &c); } free(z); }
+        struct uffdio_writeprotect w = {.range = {(uintptr_t)p + lo * PS, len}, .mode = 0}; ioctl(uffd, UFFDIO_WRITEPROTECT, &w); memset(st + lo, 2, hi - lo + 1); }
+      else { fallocate(memfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, lo * PS, len); memset(st + lo, 0, hi - lo + 1); } } free(m); fprintf(stderr, "DSM node%d owner map applied: %s\n", myid, getenv("VEIL_DSM_OWNMAP")); }
   cleanack = getenv("VEIL_DSM_CLEANACK") ? atoi(getenv("VEIL_DSM_CLEANACK")) : 0;
   fence_grants = getenv("VEIL_DSM_FENCE") && atoi(getenv("VEIL_DSM_FENCE")) >= 2;
   pthread_t t1, t2, t3; pthread_create(&t1, 0, receiver, 0); pthread_create(&t2, 0, faulter, 0); pthread_create(&t3, 0, syncer, 0);

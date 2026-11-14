@@ -24,12 +24,12 @@
 #define PS 4096
 #define BM 4096  /* per-word bit masks */
 #define MAXC 8
-#define MAXB 256
-enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT, UNREP, FENCE, SWW, SWDATA, SWGRANT, SWDEMOTE, SWSYNC, DIFFB, UPDB };
+#define MAXB 1024
+enum { RD = 1, WR, ACK, DATA_S, DATA_M, GRANT_M, RECALL, INV, REPL, DATA_REP, DIFF, UPD, INVQ, MPUT, UNREP, FENCE, SWW, SWDATA, SWGRANT, SWDEMOTE, SWSYNC, DIFFB, UPDB, INVR, GRANTR, BATCH };
 struct msg { uint8_t t, has_data; uint16_t from; uint32_t seq; uint64_t pg; };
 static int xfer(int fd, void *b, size_t n, int wr) { char *p = b; while (n) { ssize_t r = wr ? write(fd, p, n) : read(fd, p, n); if (r <= 0) return -1; p += r; n -= r; } return 0; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
-static size_t np; static int NC, cs[MAXC], mfd = -1, invq, one = 1; static uint32_t sseq[MAXC], rseq[MAXC];
+static int batchann; static size_t np; static int NC, cs[MAXC], mfd = -1, invq, one = 1; static uint32_t sseq[MAXC], rseq[MAXC];
 static char *mem, tmp[PS + BM]; static uint8_t *wrt, *sh, *rep, **lbm, *lsrc; static int8_t *owner; static uint16_t *same; static uint32_t *hot, repmin, repsilent, ramax; static double *ltime, *gt, t_start; static int8_t *gown; static double hotwin = 0.05; static long dly;
 static unsigned long nreq, nrecall, ninv, nzero, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nra, nwa, bytes;
 static int8_t *swr; static uint16_t *ppc; static uint8_t *pwm; static float *ppt; static int swmin; static unsigned long nsw, nswsw, nswsync;
@@ -95,8 +95,14 @@ static void waitack(int x, uint64_t pg) {
     if (npend < 8192) { pend[npend].c = x; pend[npend++].m = r; } } }
 static int batchlen(int c, int t, uint64_t pg) {  /* sequential stream detection per client and request type */
   int s = (int)pg >= lstart[c][t] && (int)pg <= lend[c][t] + 1; streak[c][t] = s ? streak[c][t] + 1 : 0;
-  int k = 0; if (ramax && streak[c][t] >= 2) { k = 1 << (streak[c][t] < 9 ? streak[c][t] - 1 : 8); if (k > (int)ramax) k = ramax; }
+  int k = 0; if (ramax && streak[c][t] >= 2) { k = 1 << (streak[c][t] < 11 ? streak[c][t] - 1 : 10); if (k > (int)ramax) k = ramax; }
   if (pg + k >= np) k = np - 1 - pg; lstart[c][t] = pg; lend[c][t] = pg + k; return k; }
+/* BATCH: tell the node which pages of a read-/write-ahead batch are on their way, so a vCPU that reaches one of them
+   before it is installed waits for it instead of asking again (which re-sent the page and reset the stream) */
+static void announce(int c, uint64_t *L, int n, int wr) { if (n < 2) return; uint64_t b[MAXB / 64 + 1]; memset(b, 0, sizeof b); uint64_t p0 = L[0];
+  for (int i = 0; i < n; i++) { uint64_t d = L[i] - p0; if (d <= MAXB) b[d / 64] |= 1ull << (d % 64); }
+  struct msg m = {.t = BATCH, .has_data = 1, .from = (uint16_t)gcnt[c], .seq = sseq[c]++, .pg = p0 | ((uint64_t)wr << 63)}; if (mout) mflush(); if (cs[c] < 0) return;
+  if (xfer(cs[c], &m, sizeof m, 1) || xfer(cs[c], b, sizeof b, 1)) fatal_client(c); }
 static void do_rd(int c, uint64_t pg) {
   uint64_t L[MAXB + 1]; int n = 0, k = batchlen(c, 1, pg); L[n++] = pg;
   double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; /* another node used it just now: stop speculating */ if (!rep[q] && !(swr && swr[q]) && owner[q] != c && !(sh[q] >> c & 1)) L[n++] = q; }
@@ -104,11 +110,36 @@ static void do_rd(int c, uint64_t pg) {
   int wx[MAXB + 1]; for (int i = 0; i < n; i++) { int o = owner[L[i]]; wx[i] = -1; if (o >= 0 && o != c) { sendc(o, RECALL, L[i], 0, 0, 0); nrecall++; hot[L[i]]++; wx[i] = o; } }
   if (n > 1) corkothers(c, 0);
   for (int i = 0; i < n; i++) if (wx[i] >= 0) { waitack(wx[i], L[i]); owner[L[i]] = -1; sh[L[i]] |= 1 << wx[i]; }
-  if (n > 1) cork(c, 1);
+  if (n > 1) { cork(c, 1); if (batchann) announce(c, L, n, 0); }
   for (int i = 0; i < n; i++) { uint64_t p = L[i]; sendc(c, DATA_S, p, wrt[p], wrt[p] ? mem + p * PS : 0, PS); if (!wrt[p]) nzero++; sh[p] |= 1 << c; }
   if (n > 1) { cork(c, 0); nra += n - 1; } }
+/* VEIL_DSM_LEASE=MAXPAGES: first-touch leases. A write to a page nobody has ever written (every holder has only the
+   prefilled zero copy) takes the whole 512-page block, and more blocks while the same node keeps writing fresh blocks in
+   order: the other nodes drop their zero copies of the block in one INVR (no data: they are zero), the writer gets one
+   GRANTR and writes the block with no further faults. Private memory then costs one round trip per block, not per page. */
+#define LB 512
+static uint32_t lease_max; static int64_t lnext[MAXC]; static uint32_t lrun[MAXC]; static unsigned long nlease, nlease_pg;
+static int virgin(uint64_t p, int c) { return !wrt[p] && owner[p] < 0 && !rep[p] && !(swr && swr[p]) && (sh[p] >> c & 1); }
+static int do_lease(int c, uint64_t pg) {
+  if (!lease_max || !virgin(pg, c)) return 0; uint64_t b0 = pg & ~(uint64_t)(LB - 1);
+  uint32_t nb = (int64_t)b0 == lnext[c] ? lrun[c] * 2 : 1, cap = lease_max / LB ? lease_max / LB : 1; if (nb > cap) nb = cap; if (nb > 64) nb = 64;
+  static uint64_t bm[64][LB / 64]; int any[64] = {0}; uint32_t got = 0;
+  for (uint32_t b = 0; b < nb; b++) { uint64_t s = b0 + (uint64_t)b * LB; memset(bm[b], 0, sizeof bm[b]); if (s >= np) { nb = b; break; }
+    for (int i = 0; i < LB && s + i < np; i++) if (virgin(s + i, c)) { bm[b][i / 64] |= 1ull << (i % 64); any[b] = 1; got++; }
+    if (b && !any[b]) { nb = b; break; } }  /* stop at the first block that has nothing fresh */
+  corkothers(c, 1); int need[64][MAXC]; memset(need, 0, sizeof need);
+  for (uint32_t b = 0; b < nb; b++) { if (!any[b]) continue; uint64_t s = b0 + (uint64_t)b * LB; for (int x = 0; x < NC; x++) { if (x == c || cs[x] < 0) continue; int h = 0;
+      for (int i = 0; i < LB && s + i < np && !h; i++) if ((bm[b][i / 64] >> (i % 64) & 1) && (sh[s + i] >> x & 1)) h = 1;
+      if (h) { sendc(x, INVR, s, 1, bm[b], sizeof bm[b]); need[b][x] = 1; ninv++; } } }
+  corkothers(c, 0);
+  for (uint32_t b = 0; b < nb; b++) for (int x = 0; x < NC; x++) if (need[b][x]) waitack(x, (b0 + (uint64_t)b * LB) | (1ull << 61));
+  cork(c, 1); double tn = now();
+  for (uint32_t b = 0; b < nb; b++) { if (!any[b]) continue; uint64_t s = b0 + (uint64_t)b * LB; for (int i = 0; i < LB && s + i < np; i++) if (bm[b][i / 64] >> (i % 64) & 1) { owner[s + i] = c; sh[s + i] = 0; gt[s + i] = tn; gown[s + i] = c; }
+    sendc(c, GRANTR, s, 1, bm[b], sizeof bm[b]); }
+  cork(c, 0); lnext[c] = b0 + (uint64_t)nb * LB; lrun[c] = nb; nlease++; nlease_pg += got; return 1; }
 static void do_wr(int c, uint64_t pg) {
   if (owner[pg] == c) { sendc(c, GRANT_M, pg, 0, 0, 0); return; }
+  if (do_lease(c, pg)) return;
   uint64_t L[MAXB + 1]; int n = 0, k = batchlen(c, 2, pg); L[n++] = pg;
   double tn = now(); for (int i = 1; i <= k; i++) { uint64_t q = pg + i; if (gown[q] != c && tn - gt[q] < hotwin) break; if (!rep[q] && !(swr && swr[q]) && owner[q] != c) L[n++] = q; }
   if (n > 1) corkothers(c, 1);
@@ -117,7 +148,7 @@ static void do_wr(int c, uint64_t pg) {
       else if (sh[p] >> x & 1) { if (invq) { sendc(x, INVQ, p, 0, 0, 0); ninv++; hot[p]++; sh[p] &= ~(1 << x); } else { sendc(x, INV, p, 0, 0, 0); ninv++; hot[p]++; wx[i][x] = 1; } } } }
   if (n > 1) corkothers(c, 0);
   for (int i = 0; i < n; i++) for (int x = 0; x < NC; x++) if (wx[i][x]) waitack(x, L[i]);
-  if (n > 1) cork(c, 1);
+  if (n > 1) { cork(c, 1); if (batchann) announce(c, L, n, 1); }
   for (int i = 0; i < n; i++) { uint64_t p = L[i]; if (sh[p] >> c & 1) sendc(c, GRANT_M, p, 0, 0, 0); else { sendc(c, DATA_M, p, wrt[p], wrt[p] ? mem + p * PS : 0, PS); if (!wrt[p]) nzero++; } owner[p] = c; sh[p] = 0; }
   if (n > 1) { cork(c, 0); nwa += n - 1; } }
 /* VEIL_DSM_HOLD_US: a node that was just granted a page exclusively keeps it for at least this long; a competing request is
@@ -148,8 +179,8 @@ static void derep(uint64_t pg) {  /* every holder flushes its diff and drops wri
   for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) waitack(x, pg);
   rep[pg] = 0; same[pg] = 0; for (int x = 0; x < NC; x++) if (cs[x] >= 0 && (sh[pg] >> x & 1)) sendc(x, INVQ, pg, 0, 0, 0); sh[pg] = 0; owner[pg] = -1; mput(pg); nderep++; }
 static void stats(void) {
-  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu held=%lu%s data_MiB=%.1f\n",
-    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, nheld, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
+  fprintf(stderr, "DSM home t=%.0fs requests=%lu recalls=%lu invalidations=%lu zero_grants=%lu readahead=%lu writeahead=%lu wb_changed=%lu wb_same=%lu replicated=%lu dereplicated=%lu diffs=%lu diff_words=%lu diff_conflicts=%lu seq_err=%lu mirror_puts=%lu fences=%lu sw=%lu sw_switch=%lu sw_sync=%lu sw_batches=%lu clean_acks=%lu clean_mismatch=%lu held=%lu leases=%lu lease_pages=%lu%s data_MiB=%.1f\n",
+    now() - t_start, nreq, nrecall, ninv, nzero, nra, nwa, nchg, nsame, nrep, nderep, ndiff, ndiffw, nconf, seqerr, nmput, nfen, nsw, nswsw, nswsync, nbatch, nclean, nclean_bad, nheld, nlease, nlease_pg, mfd >= 0 ? "" : "(no mirror)", bytes / 1048576.0);
   fprintf(stderr, "DSM hot:"); for (int k = 0; k < 6; k++) { size_t bi = 0; for (size_t i = 0; i < np; i++) if (hot[i] > hot[bi]) bi = i; if (!hot[bi]) break; fprintf(stderr, " %zx:%u%s/s%u", bi, hot[bi], rep[bi] ? "R" : "", same[bi]); hot[bi] = 0; } fprintf(stderr, "\n"); memset(hot, 0, np * 4); }
 static int listen_on(int port) { int ls = socket(AF_INET, SOCK_STREAM, 0); setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
   if (bind(ls, (void *)&a, sizeof a) || listen(ls, 16)) { perror("bind"); exit(1); } return ls; }
@@ -171,6 +202,7 @@ static void accept_client(int ls) {  /* handshake: u16 id (bit15 = resume after 
 static void init(size_t n, int nc) { np = n; NC = nc; mem = calloc(np, PS); wrt = calloc(np, 1); sh = calloc(np, 1); rep = calloc(np, 1); owner = malloc(np); memset(owner, -1, np); same = calloc(np, 2); hot = calloc(np, 4); lbm = calloc(np, sizeof *lbm); lsrc = calloc(np, 1); ltime = calloc(np, sizeof(double)); gt = calloc(np, sizeof(double)); gown = malloc(np); memset(gown, -1, np); if (getenv("VEIL_DSM_HOTWIN_MS")) hotwin = atof(getenv("VEIL_DSM_HOTWIN_MS")) / 1e3;
   for (int i = 0; i < MAXC; i++) cs[i] = -1; t_start = now(); invq = getenv("VEIL_DSM_INVQ") && atoi(getenv("VEIL_DSM_INVQ"));
   repmin = getenv("VEIL_DSM_REPMIN") ? atoi(getenv("VEIL_DSM_REPMIN")) : 0; repsilent = getenv("VEIL_DSM_REPSILENT") ? atoi(getenv("VEIL_DSM_REPSILENT")) : 0; dly = getenv("VEIL_DSM_DELAY_US") ? atol(getenv("VEIL_DSM_DELAY_US")) : 0; ramax = getenv("VEIL_DSM_RA") ? atoi(getenv("VEIL_DSM_RA")) : 0; if (ramax > MAXB) ramax = MAXB;
+  batchann = !getenv("VEIL_DSM_BATCHANN") || atoi(getenv("VEIL_DSM_BATCHANN")); lease_max = getenv("VEIL_DSM_LEASE") ? atoi(getenv("VEIL_DSM_LEASE")) : 0; for (int i = 0; i < MAXC; i++) lnext[i] = -1;
   hold_s = getenv("VEIL_DSM_HOLD_US") ? atof(getenv("VEIL_DSM_HOLD_US")) / 1e6 : 0; swmin = getenv("VEIL_DSM_SW") ? atoi(getenv("VEIL_DSM_SW")) : 0; if (swmin > 0) { swr = calloc(np, 1); ppc = calloc(np, 2); pwm = calloc(np, 1); ppt = calloc(np, sizeof(float)); } }
 static void prof(void) {  /* VEIL_DSM_PROF_S: per-interval request counts per client and the hottest pages (mask: low nibble = readers, high = writers, bit = client) */
   fprintf(stderr, "DSM prof t=%.1f", now() - t_start); for (int c = 0; c < NC; c++) fprintf(stderr, " c%d=rd%lu/wr%lu", c, pt_req[c][0], pt_req[c][1]); memset(pt_req, 0, sizeof pt_req); fprintf(stderr, " top:");
@@ -201,6 +233,10 @@ static int serve(int ls) {
   stats(); fprintf(stderr, "DSM home done\n"); return 0; }
 int main(int argc, char **v) {
   if (argc >= 5 && !strcmp(v[1], "home")) { init(atol(v[3]), atoi(v[4])); if (getenv("VEIL_DSM_PREFILL") && atoi(getenv("VEIL_DSM_PREFILL"))) memset(sh, (1 << NC) - 1, np);
+    /* VEIL_DSM_OWNMAP="ID:LO-HI,...": affinity placement. Those pages start owned (writable, zero) by that node and held by
+       nobody else, as a NUMA-aware guest would place each node's memory on its own host. Only the primary applies it: a
+       standby's directory is rebuilt from the nodes' state dumps. */
+    if (getenv("VEIL_DSM_OWNMAP")) { char *m = strdup(getenv("VEIL_DSM_OWNMAP")), *sv = 0; for (char *t = strtok_r(m, ",", &sv); t; t = strtok_r(0, ",", &sv)) { int id; unsigned long lo, hi; if (sscanf(t, "%d:%lu-%lu", &id, &lo, &hi) == 3) for (unsigned long p = lo; p <= hi && p < np; p++) { owner[p] = id; sh[p] = 0; } } free(m); }
     if (argc >= 6) { char h[64]; int port; sscanf(v[5], "%63[^:]:%d", h, &port); struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)}; inet_pton(AF_INET, h, &a.sin_addr);
       for (int i = 0; i < 600; i++) { mfd = socket(AF_INET, SOCK_STREAM, 0); setsockopt(mfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); if (!connect(mfd, (void *)&a, sizeof a)) break; close(mfd); mfd = -1; usleep(200000); }
       fprintf(stderr, "DSM home: mirror %s %s\n", v[5], mfd >= 0 ? "connected (synchronous page mirroring on)" : "UNREACHABLE"); }
