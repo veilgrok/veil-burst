@@ -38,12 +38,12 @@ static void *run(void *a) { struct job *j = a; char *b = j->b; const char *w = j
     for (long i = 0; i < ops; i++) { x = mix(x + i); pb[x & 8191] += x; if (every && i % every == 0) __atomic_fetch_add(&cnt[(i / every & 3) * 8], 1, __ATOMIC_SEQ_CST); } chk += x; }
   else if (!strcmp(w, "stream")) { double *a = (double *)(b + lo0 * PS); size_t m = (hi0 - lo0) * PS / 8 / 3, mp = m / T, i0 = j->t * mp, i1 = j->t == T - 1 ? m : i0 + mp; for (int r = 0; r < 8 * SC; r++) for (size_t i = i0; i < i1; i++) a[i] = a[m + i] + 3.0 * a[2 * m + i]; chk += (uint64_t)a[i1 - 1]; }
   else if (!strcmp(w, "gather")) { long ops = (long)(2e8 * SC / div); uint64_t x = me * 7919 + 1, s = 0; for (long i = 0; i < ops; i++) { x = mix(x); s += tab[x % tn]; } chk += s; }
-  else if (!strcmp(w, "sweep") || !strcmp(w, "hotcold")) {  /* capacity: write the whole slice, then read it (sweep: 2 full passes; hotcold: random reads, 90% in its first tenth) */
+  else if (!strcmp(w, "sweep") || !strcmp(w, "hotcold")) {  /* capacity: write the whole slice, then read it (sweep: 2 full passes; hotcold: random reads in its first tenth, except ARG per million (100) anywhere) */
     uint64_t *a = (uint64_t *)(b + lo * PS); size_t m = (hi - lo) * PS / 8, s = 0; double tw = now();
     for (size_t i = 0; i < m; i += 8) a[i] = mix(i + lo);
     double tr = now();
     if (!strcmp(w, "sweep")) for (int r = 0; r < 2; r++) for (size_t i = 0; i < m; i += 8) { if (a[i] != mix(i + lo)) bad_g++; s += a[i]; }
-    else { uint64_t x = me + 1, hot = m / 10 / 8; long ops = (long)(4e7 * SC / div); for (long i = 0; i < ops; i++) { x = mix(x); size_t q = (x % 10 ? x % hot : x % (m / 8)) * 8; if (a[q] != mix(q + lo)) bad_g++; s += a[q]; } }
+    else { uint64_t x = me + 1, hot = m / 10 / 8, cold = arg > 0 ? arg : 100; long ops = (long)(4e7 * SC / div); for (long i = 0; i < ops; i++) { x = mix(x); size_t q = ((x >> 20) % 1000000 >= cold ? x % hot : x % (m / 8)) * 8; if (a[q] != mix(q + lo)) bad_g++; s += a[q]; } }
     fprintf(stderr, "DSMN part k=%d t=%d write_s=%.3f read_s=%.3f\n", k, j->t, tr - tw, now() - tr); chk += s; }
   else if (!strcmp(w, "touch")) { for (size_t p = lo; p < hi; p++) b[p * PS + 8] = 1; chk += hi - lo; }
   j->chk = chk; return 0; }

@@ -3,9 +3,10 @@
 # DSM node per runner with THREADS = that runner's cores, against the same job on ONE runner with all its cores and no DSM.
 # Then the correctness gates: dsmt cross-check/torture between runners 0 and 1, and a kill of the primary home (runner 2,
 # mirror on runner 0) mid-run. Knobs (in MODES after P): KN=runners (4) NS=1,2,4 WL=cpu,stream,gather,shared,touch
+#   SCALE=work multiplier (16) CAP=1 capacity runs (CAPMIB=6144 data (fits the default 8 GiB /dev/shm), CAPLOCAL=pages kept on the compute runner (393216 = 1.5 GiB, a quarter), COLD=ppm (100))
 #   MIB=per-node shm size (2048) RA (1024) LEASE (8192) REGION (8) CLEANACK (1) SW (0) HOLD_US (0) GATES=1 KILLAT (secs, 2.0)
 # Every result line is "POOL ..." in the run log (via the relay KV, like vsplit2.sh). Speedup = base_s / job_s(N).
-set -u; for kv in ${MODES#P}; do case $kv in KN=*|NS=*|WL=*|MIB=*|RA=*|LEASE=*|REGION=*|CLEANACK=*|SW=*|HOLD_US=*|GATES=*|KILLAT=*) export "$kv";; esac; done
+set -u; for kv in ${MODES#P}; do case $kv in KN=*|NS=*|WL=*|MIB=*|RA=*|LEASE=*|REGION=*|CLEANACK=*|SW=*|HOLD_US=*|GATES=*|KILLAT=*|SCALE=*|CAP=*|CAPMIB=*|CAPLOCAL=*|COLD=*) export "$kv";; esac; done
 KN=${KN:-4}; NS=$(echo ${NS:-1,2,4} | tr , " "); WL=$(echo ${WL:-cpu,stream,gather,shared,touch} | tr , " "); MIB=${MIB:-2048}; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text'); CPU=$(lscpu | sed -n 's/Model name: *//p' | head -1 | tr -cd 'A-Za-z0-9')
 K put pl-$RUN-reg-$G "$REG|$CPU|$(nproc)"; ALL=$(K wait pl-$RUN-reg- $NN 900) || ALL=$(K wait pl-$RUN-reg- $KN 5)
@@ -28,7 +29,7 @@ for k,v in d.items():
   i=int(k.rsplit('-',1)[1]); p=json.loads(v)
   if i!=$G: print(i,p['ip'],p['port'],p['pub'])" | while read i ip port pub; do wg set wg0 peer $pub endpoint $ip:$port allowed-ips 10.88.0.$((i+1))/32 persistent-keepalive 1; done
 sleep 4; for i in $(seq 0 $((KN-1))); do [ $i = $G ] || L "POOL ping $G->$i $(ping -c 20 -i 0.2 10.88.0.$((i+1)) | tail -1)"; done
-T=$(nproc); NPG=$((MIB * 256)); E="VEIL_DSM_PREFILL=1 VEIL_DSM_RA=${RA:-1024} VEIL_DSM_REPMIN=16 VEIL_DSM_LEASE=${LEASE:-8192} VEIL_DSM_REGION=${REGION:-8} VEIL_DSM_SW=${SW:-0} VEIL_DSM_HOLD_US=${HOLD_US:-0}"
+export SCALE=${SCALE:-16}; T=$(nproc); NPG=$((MIB * 256)); E="VEIL_DSM_PREFILL=1 VEIL_DSM_RA=${RA:-1024} VEIL_DSM_REPMIN=16 VEIL_DSM_LEASE=${LEASE:-8192} VEIL_DSM_REGION=${REGION:-8} VEIL_DSM_SW=${SW:-0} VEIL_DSM_HOLD_US=${HOLD_US:-0}"
 step=0
 for W in $WL; do
   # one runner, all its cores, no DSM: the baseline every speedup is measured against (run twice, the faster kept)
@@ -40,6 +41,16 @@ for W in $WL; do
       L "POOL dsm w=$W n=$N $(echo "$R" | sed 's/.*compute_s/compute_s/')"; K put pl-$RUN-d$step-$G 1 >/dev/null; rm -f /dev/shm/veilP*; fi
     if [ $G = 0 ]; then K wait pl-$RUN-d$step- $N 900 >/dev/null; sleep 1; kill -9 $HP 2>/dev/null; L "POOL home w=$W n=$N $(grep -a 'DSM home t=' home_$step.log | tail -1 | grep -o 'requests=[0-9]*\|recalls=[0-9]*\|leases=[0-9]*\|stride_pf=[0-9]*\|region_pf=[0-9]*\|data_MiB=[0-9.]*' | tr '\n' ' ')"; fi
   done; done
+# ---- capacity (CAP=1, needs >= 2 runners): one compute runner keeps CAPLOCAL pages, runner 1 is the memory node holding the rest.
+# Compared with the same job on one runner that has the RAM. sweep = write all then 2 read passes; hotcold = random reads, COLD ppm anywhere.
+if [ "${CAP:-0}" = 1 ] && [ $KN -ge 2 ] && [ $G -lt 2 ]; then CM=${CAPMIB:-6144}; CN=$((CM * 256))
+  for W in sweep hotcold; do step=$((step+1)); PORT=$((7000 + step))
+    if [ $G = 0 ]; then rm -f /dev/shm/veilP*; L "POOL capbase w=$W mib=$CM $(THREADS=1 ./dsmn -1 1 /dev/shm/veilP $CM $W ${COLD:-100} 2>&1 | tr '\n' ' ' | sed 's/chk=[0-9a-f]* //')"; rm -f /dev/shm/veilP*; fi
+    if [ $G = 1 ]; then env VEIL_DSM_PREFILL=0 VEIL_DSM_RA=${RA:-1024} timeout -s KILL 1800 ./dsmh home $PORT $CN 1 2> cap_home_$step.log & HP=$!; sleep 0.5; K put pl-$RUN-c$step-0 1 >/dev/null; K wait pl-$RUN-cd$step- 1 1900 >/dev/null; kill -9 $HP; L "POOL caphome w=$W $(grep -a 'DSM home t=' cap_home_$step.log | tail -1 | grep -o 'requests=[0-9]*\|region_pf=[0-9]*\|evictions=[0-9]*\|data_MiB=[0-9.]*' | tr '\n' ' ')"; fi
+    if [ $G = 0 ]; then K wait pl-$RUN-c$step- 1 900 >/dev/null; rm -f /dev/shm/veilP*
+      R=$(env VEIL_DSM_PREFILL=0 VEIL_DSM_LOCALMAX=${CAPLOCAL:-393216} VEIL_DSM_CLEANACK=1 LD_PRELOAD=$PWD/dsm_shim.so VEIL_DSM_MATCH=veilP VEIL_DSM_HOME=10.88.0.2:$PORT VEIL_DSM_ID=0 THREADS=1 timeout -s KILL 1800 ./dsmn 0 1 /dev/shm/veilP0 $CM $W ${COLD:-100} 2> cap_node_$step.log)
+      L "POOL cap w=$W mib=$CM local_pages=${CAPLOCAL:-393216} $(echo "$R" | sed 's/chk=[0-9a-f]* //') $(grep -a 'DSMN part' cap_node_$step.log | tr '\n' ' ') $(grep -a 'faults' cap_node_$step.log | tail -1 | grep -o 'evictions=.*')"; rm -f /dev/shm/veilP*; K put pl-$RUN-cd$step-0 1 >/dev/null; fi
+  done; fi
 # ---- gates (need >= 3 runners): cross-check + torture between runners 0 and 1 with home on 0; then kill the primary home
 if [ "${GATES:-1}" = 1 ] && [ $KN -ge 3 ] && [ $G -lt 3 ]; then
   GE="$E VEIL_DSM_CLEANACK=${CLEANACK:-1} LD_PRELOAD=$PWD/dsm_shim.so VEIL_DSM_MATCH=veilT"
