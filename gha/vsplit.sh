@@ -3,6 +3,7 @@
 # guest RAM = per-node /dev/shm file kept coherent by veil-dsm (gha/bin/dsm_shim.so built vs glibc 2.27 + dsm home).
 set -u; MODES=${MODES:-B S1 S2 X}; has() { [[ " $MODES " == *" $1 "* ]]; }; G=$GIDX; RUN=$GITHUB_RUN_ID; K() { python3 gha/kv.py "$@"; }; J() { echo "VEIL_JSON $1"; }
 case " ${MODES:-} " in *" P "*) exec bash gha/pool.sh;; esac
+case " ${MODES:-} " in *" L "*) [ -f gha/llm/vsplit-llm.sh ] && exec bash gha/llm/vsplit-llm.sh; echo "mode L needs gha/llm/vsplit-llm.sh (apply the veil-llm patch)"; exit 1;; esac
 case " ${MODES:-} " in *" B2 "*|*" S3 "*|*" X2 "*|*" X3 "*|*" X4 "*|*" R "*) exec bash gha/vsplit2.sh;; esac
 REG=$(curl -s -m 5 -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text')
 if [ "${NN:-2}" -gt 2 ]; then
