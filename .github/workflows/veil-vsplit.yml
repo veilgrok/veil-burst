@@ -1,38 +1,34 @@
-name: veil-vsplit
+# veil-llm: one LLM sharded across N runners (pipeline and tensor layouts), measured end to end.
+# Dispatch only. Relay token is an existing Actions secret (used only for address rendezvous).
+name: Veil LLM shard
 on:
   workflow_dispatch:
     inputs:
-      relay_url: {required: true, type: string}
-      art_run: {required: false, default: "repo", type: string}
-      n: {required: false, default: "[0,1,2,3,4,5]", type: string}
-      modes: {required: false, default: "S1 S2 X", type: string}
-      eptad: {required: false, default: "0", type: string}
-      npt: {required: false, default: "1", type: string}
-permissions: {contents: read, actions: read}
+      relay_url: {description: Veil relay URL, required: true, type: string}
+      n: {description: JSON matrix indices, required: false, default: "[0,1,2,3,4,5,6,7]", type: string}
+      npeers: {required: false, default: "8", type: string}
+      models: {description: models that fit one runner, required: false, default: "s1,m7", type: string}
+      big: {description: models bigger than one runner, required: false, default: "l34,l70", type: string}
+      prompt: {required: false, default: "64", type: string}
+      gen: {required: false, default: "32", type: string}
+      tag: {required: false, default: "", type: string}
+run-name: "Veil LLM ${{ inputs.tag }}"
+permissions: {contents: read}
 jobs:
-  node:
+  llm:
     strategy: {fail-fast: false, matrix: {gidx: "${{ fromJSON(inputs.n) }}"}}
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - if: inputs.art_run == 'repo'
-        run: mkdir -p art && cp gha/bin/gvm/l2root.tar.gz gha/bin/gvm/bzImage art/
-      - if: inputs.art_run != 'repo'
-        uses: actions/download-artifact@v4
-        with: {name: gvm, path: art, run-id: "${{ inputs.art_run }}", github-token: "${{ github.token }}"}
-      - name: vcpu split
+      - name: llm
         env:
           GIDX: ${{ matrix.gidx }}
-          NN: ${{ strategy.job-total }}
-          MODES: ${{ inputs.modes }}
+          NPEERS: ${{ inputs.npeers }}
+          LLM_MODELS: ${{ inputs.models }}
+          LLM_BIG: ${{ inputs.big }}
+          LLM_PROMPT: ${{ inputs.prompt }}
+          LLM_GEN: ${{ inputs.gen }}
           VEIL_RELAY_URL: ${{ inputs.relay_url }}
           VEIL_RELAY_TOKEN: ${{ secrets.VEIL_RELAY_TOKEN }}
-        run: |
-          sudo sysctl -qw vm.unprivileged_userfaultfd=1; sudo modprobe wireguard || true
-          # Intel: EPT A/D makes guest page-table walks count as writes -> page-table pages ping-pong in DSM; turn it off
-          if grep -qw vmx /proc/cpuinfo && [ "${{ inputs.eptad }}" = 0 ]; then sudo modprobe -r kvm_intel && sudo modprobe kvm_intel eptad=0; echo "eptad=$(cat /sys/module/kvm_intel/parameters/eptad)"; fi
-          # AMD: nested paging walks also count as writes; npt=0 (shadow paging) keeps guest page-table pages read-only to the walker
-          if grep -qw svm /proc/cpuinfo && [ "${{ inputs.npt }}" = 0 ]; then sudo modprobe -r kvm_amd && sudo modprobe kvm_amd npt=0; echo "npt=$(cat /sys/module/kvm_amd/parameters/npt)"; fi
-          sudo chmod 666 /dev/kvm
-          docker run --rm --privileged --network host -v /dev:/dev -v /sys/module:/sys/module:ro -v $GITHUB_WORKSPACE:/w -w /w -e GIDX -e NN -e MODES -e GITHUB_RUN_ID -e VEIL_RELAY_URL -e VEIL_RELAY_TOKEN debian:trixie bash -c 'export DEBIAN_FRONTEND=noninteractive; timeout 600 apt-get -qq update >/dev/null 2>&1; timeout 900 apt-get -qq install -y --no-install-recommends qemu-system-x86 cpio gcc libc6-dev python3 util-linux iproute2 iputils-ping wireguard-tools curl ca-certificates procps >/dev/null 2>&1; echo "STEP docker-apt rc=$? $(qemu-system-x86_64 --version | head -1)"; bash gha/vsplit.sh'
+        run: timeout 5000 python3 gha/llm/llm_runner.py
