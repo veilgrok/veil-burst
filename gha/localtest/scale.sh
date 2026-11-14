@@ -8,7 +8,7 @@ gcc -O2 -o dsmn dsmn.c -lpthread && gcc -O2 -o dsmh_s ${SRC:-..}/dsmh.c && gcc -
 pkill -9 -x dsmn 2>/dev/null; pkill -9 -x dsmh_s 2>/dev/null; rm -f /dev/shm/veilS*
 if [ "$MODE" = base ]; then taskset -c 0 ./dsmn -1 $N /dev/shm/veilS $MIB $W $ARG; rm -f /dev/shm/veilS*; exit; fi
 MAP=$(./dsmn map $N $MIB); [ "${OWN:-1}" = 0 ] && MAP=""
-E="VEIL_DSM_PREFILL=${PREFILL:-1} VEIL_DSM_RA=${RA:-1024} VEIL_DSM_REPMIN=16 ${MAP:+VEIL_DSM_OWNMAP=$MAP} ${XENV:-}"
+E="VEIL_DSM_PREFILL=${PREFILL:-1} VEIL_DSM_RA=${RA:-1024} VEIL_DSM_REPMIN=${REPMIN:-0} ${MAP:+VEIL_DSM_OWNMAP=$MAP} ${XENV:-}"
 K0=1; [ "${CAPREMOTE:-0}" = 1 ] && K0=0; LP=""; for k in $(seq $K0 $((N-1))); do ./lag $((PORT+100+k)) 127.0.0.1:$PORT ${LAG_US:-0} ${LAG_MBPS:-0} > /dev/null 2>&1 & LP="$LP $!"; done
 env $E taskset -c 0 ./dsmh_s home $PORT $NPG $N 2> home_s.log & HP=$!; sleep 0.3
 PIDS=""; for k in $(seq $((N-1)) -1 0); do HPORT=$PORT; [ $k -ge $K0 ] && HPORT=$((PORT+100+k))
