@@ -36,6 +36,11 @@ def plan(ram_gb, cpus, kind="vm", sharing="private", runner=RUNNER, shared_gb=0.
     memory_runners = 0 if ram_gb <= local_cap else math.ceil((ram_gb - local_cap) / (usable * 0.9))
     home = "runner 0 (with node 0)" if memory_runners == 0 else "memory runner m0 (the backing store), mirror on m1 or node 0"
     t = r["rtt_ms"] / 1000.0; f = CLASS[sharing]["f_per_s"]
+    # f was calibrated at 2 nodes; it grows with the node count. Read-shared: each node's one-time pull stays the same
+    # while its work shrinks, so f ~ N/2. Write-shared: more nodes contend for each page, so f ~ (N-1)^1.6. Fitted to the
+    # emulated 4-node curves (gather 2.2x, shared counters 0.35x at 4 nodes).
+    if compute > 2 and sharing == "read": f *= compute / 2.0
+    if compute > 2 and sharing == "write": f *= (compute - 1) ** 1.6
     eff_remote = 1.0 / (1.0 + f * t * 1.0)  # each remote event stalls one core for one round trip
     if sharing == "read" and shared_gb: eff_remote = min(eff_remote, 1.0)  # one-time pull: amortised, see notes
     speedup = compute * eff_remote if compute > 1 else 1.0
@@ -55,10 +60,12 @@ def plan(ram_gb, cpus, kind="vm", sharing="private", runner=RUNNER, shared_gb=0.
                          f"(about {usable * 0.9:.0f} GB); striping it over several memory runners is on the roadmap.")
     if sharing == "write":
         notes.append("write-shared data costs a round trip per handoff: expect it to be slower than one runner unless the guest "
-                     "keeps per-CPU copies (per-CPU counters, sharded locks). Measured: 1 atomic in 1000 ops ran 0.72-0.77x on 2 nodes.")
+                     "keeps per-CPU copies (per-CPU counters, sharded locks). Measured: 1 atomic in 1000 ops ran 0.72-0.77x on 2 nodes and 0.34-0.37x on 4.")
+    if speedup < 1.0 and compute > 1 and ram_gb <= usable:
+        notes.append("advice: this job fits on one runner and spreading it is predicted to slow it down; run it on one runner.")
     if sharing == "read":
         notes.append("read-shared data is pulled once per node (2 MiB regions after 8 misses), then read locally; "
-                     "measured 1.58x on 2 nodes for a 32 MiB table, rising with longer runs.")
+                     "measured 1.72x on 2 nodes and 2.2x on 4 for a 32 MiB table; longer runs amortise the pull better.")
     if kind == "llm":
         notes.append("LLM: weights are read-shared; shard layers across runners (pipeline) for capacity and use batching for "
                      "throughput; tensor sharding only inside a runner (two all-reduces per layer cost ~2 RTT each).")
@@ -68,7 +75,7 @@ def plan(ram_gb, cpus, kind="vm", sharing="private", runner=RUNNER, shared_gb=0.
                 topology=dict(compute_runners=compute, cores_per_runner=per_node_cores, memory_runners=memory_runners, home=home,
                               total_runners=compute + memory_runners),
                 knobs=knobs, predicted=dict(speedup_vs_one_runner=round(speedup, 2), efficiency=round(speedup / compute, 2) if compute > 1 else 1.0,
-                                            basis="prediction from e=1/(1+f*t) with f calibrated on emulated 2-node runs, not a runner measurement"),
+                                            basis="prediction from e=1/(1+f*t) with f calibrated on emulated 2- and 4-node runs, not a runner measurement"),
                 notes=notes)
 
 def show(p):
